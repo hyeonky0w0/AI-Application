@@ -16,7 +16,7 @@
 ## 🌟 프로젝트 개요 (Project Overview)
 2025년은 'AI 에이전트'의 해로 주목받고 있습니다. 가트너의 예측에 따르면 2028년까지 일상 업무의 15%를 AI 에이전트가 독자적으로 결정할 것으로 전망되며, 이미 주요 기업들의 치열한 개발 경쟁이 시작되었습니다. 내 커리어, 내 주변, 사회적인 선한 영향력을 주제로 하는 실전에서 쓸 수 있는 Agent 를 개발하며 AI 뿐만아니라 CS 지식을 같이 개발하면서 대체불가 인력으로 성장을 목표로 합니다.
 <br>  
-
+<br>  
 
 
 ## 🎯 프로젝트 목표 (Project Vision)
@@ -51,13 +51,13 @@
 
 
 ## 🧑 팀 소개
-| 이름 | 소속 | 역할 | 담당 부분 |
-|--------|---------|-------|----------|
-| [이현경](blue87083@gmail.com) | 컴퓨터공학과 | 팀장 | - 백엔드 개발<br>- 실제로 쓸 수 있는 에이전트 |
-| [손정민](suruna1026@gmail.com) | 컴퓨터공학과 | 팀원 | - 폭발적 효율성의 Agent<br>- Graph Neural Network |
-| [양진선](yanggi200@gmail.com) | 컴퓨터공학과 | 팀원 | - 폭발적 효율성의 Agent<br>- Graph Neural Network |
-| [이가윤](gayunphone@gmail.com) | 컴퓨터공학과 | 팀원 | - 폭발적 효율성의 Agent<br>- Graph Neural Network |
-| [이윤설](leeyunseol.cs@gmail.com) | 컴퓨터공학과 | 팀원 | - 폭발적 효율성의 Agent<br>- Graph Neural Network |
+| 이름 | 이메일 | 소속 | 역할 | 담당 부분 |
+|--------|---------|-------|-------|----------|
+| [이현경] | blue87083@gmail.com | 컴퓨터공학과 | 팀장 | - 백엔드 개발<br>- 실제로 쓸 수 있는 에이전트 |
+| [손정민] | suruna1026@gmail.com | 컴퓨터공학과 | 팀원 | - 폭발적 효율성의 Agent<br>- Graph Neural Network |
+| [양진선] | yanggi200@gmail.com | 컴퓨터공학과 | 팀원 | - 폭발적 효율성의 Agent<br>- Graph Neural Network |
+| [이가윤] | gayunphone@gmail.com | 컴퓨터공학과 | 팀원 | - 폭발적 효율성의 Agent<br>- Graph Neural Network |
+| [이윤설] | leeyunseol.cs@gmail.com | 컴퓨터공학과 | 팀원 | - 폭발적 효율성의 Agent<br>- Graph Neural Network |
 
 
 
