@@ -1,5 +1,5 @@
-./checkpoints
-./__pycache__
-./dataset
-./result
-/vis_output
+checkpoints/
+__pycache__/
+dataset/
+results/
+vis_output/
