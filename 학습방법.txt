@@ -1,0 +1,27 @@
+!pip install MediaPipe
+
+# 1단계 — 캐시 생성 (1회만)
+!python AI-Application/preprocess_cache.py \
+    --json_dir /content/label_blouse \
+    --image_dir /content/image_blouse \
+    --cache_dir /content/cache_blouse \
+    --categories blouse \
+    --view_type front
+
+# 2단계 — 학습
+!python AI-Application/train.py --exp 4 \
+    --json_dir /content/label_blouse \
+    --image_dir /content/image_blouse \
+    --cache_dir /content/cache_blouse \
+    --categories blouse \
+    --view_type front \
+    --epochs 50 \
+    --num_workers 4
+
+# 체크포인트랑 결과 드라이브에 저장
+from google.colab import drive
+drive.mount('/content/drive')
+
+!cp -r /content/checkpoints "/content/drive/MyDrive/clothing_data/checkpoints3"
+!cp -r /content/results "/content/drive/MyDrive/clothing_data/results3"
+print("저장 완료!")

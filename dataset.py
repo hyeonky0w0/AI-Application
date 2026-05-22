@@ -61,54 +61,68 @@ class ScaleNormalizer:
         self.n_total   = 0
         self.n_success = 0
         try:
-            import mediapipe as mp
-            self.pose = mp.solutions.pose.Pose(
-                static_image_mode=True,
-                model_complexity=1,
-                min_detection_confidence=0.5,
-            )
-            self.available = True
-            logger.info("MediaPipe 초기화")
-        except ImportError:
-            self.available = False
-            logger.warning("mediapipe 없이 letterbox resize만 사용")
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+            import urllib.request, os
 
-    def success_rate(self) -> float:
-        if self.n_total == 0:
-            return 0.0
-        return self.n_success / self.n_total
+            model_path = "/tmp/pose_landmarker.task"
+            if not os.path.exists(model_path):
+                urllib.request.urlretrieve(
+                    "https://storage.googleapis.com/mediapipe-models/"
+                    "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+                    model_path
+                )
+
+            base_options = mp_python.BaseOptions(model_asset_path=model_path)
+            options = vision.PoseLandmarkerOptions(
+                base_options=base_options,
+                output_segmentation_masks=False,
+            )
+            self.detector    = vision.PoseLandmarker.create_from_options(options)
+            self.use_new_api = True
+            self.available   = True
+            logger.info("MediaPipe PoseLandmarker 초기화 (new API)")
+
+        except Exception as e:
+            self.available   = False
+            self.use_new_api = False
+            logger.warning(f"mediapipe 없이 letterbox resize만 사용: {e}")
+
+    def success_rate(self):
+        return self.n_success / self.n_total if self.n_total > 0 else 0.0
 
     def __call__(
         self,
         image: np.ndarray,
         shoulder_width_cm: float,
         target_px_per_cm: float = 5.0,
-    ) -> Tuple[np.ndarray, bool]:
+    ):
         self.n_total += 1
         if not self.available or shoulder_width_cm <= 0:
             return letterbox(image, TARGET_SIZE), False
 
+        import mediapipe as mp
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        result = self.pose.process(rgb)
 
-        if not result.pose_landmarks:
+        if self.use_new_api:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self.detector.detect(mp_image)
+            if not result.pose_landmarks:
+                return letterbox(image, TARGET_SIZE), False
+
+            h, w = image.shape[:2]
+            lms = result.pose_landmarks[0]
+            lx = int(lms[11].x * w);  ly = int(lms[11].y * h)
+            rx = int(lms[12].x * w);  ry = int(lms[12].y * h)
+        else:
             return letterbox(image, TARGET_SIZE), False
-
-        h, w = image.shape[:2]
-        lm = result.pose_landmarks.landmark
-        # MediaPipe에서 11는 왼쪽어깨, 12는 오른쪽 어깨
-        lx, ly = int(lm[11].x * w), int(lm[11].y * h)
-        rx, ry = int(lm[12].x * w), int(lm[12].y * h)
 
         shoulder_px = np.sqrt((rx - lx)**2 + (ry - ly)**2)
         if shoulder_px < 10:
             return letterbox(image, TARGET_SIZE), False
 
-        current_px_per_cm = shoulder_px / shoulder_width_cm
-        scale = target_px_per_cm / current_px_per_cm
-
-        new_w = int(w * scale)
-        new_h = int(h * scale)
+        scale = target_px_per_cm / (shoulder_px / shoulder_width_cm)
+        new_w, new_h = int(image.shape[1] * scale), int(image.shape[0] * scale)
         if new_w < 10 or new_h < 10:
             return letterbox(image, TARGET_SIZE), False
 
@@ -221,6 +235,7 @@ class ClothingDataset(Dataset):
         self,
         json_dir: str,
         image_dir: str,
+        cache_dir: Optional[str] = None,      # ← 추가: 전처리 캐시 디렉토리
         categories: List[str] = ["blouse"],
         view_type: str = "wear",
         use_mediapipe: bool = True,
@@ -232,9 +247,14 @@ class ClothingDataset(Dataset):
     ):
         self.json_dir  = json_dir
         self.image_dir = image_dir
+        self.cache_dir = cache_dir
         self.view_type = view_type
         self.augment   = augment
-        self.scale_normalizer = ScaleNormalizer() if use_mediapipe else None
+
+        # 캐시가 있으면 MediaPipe 불필요
+        self.scale_normalizer = (
+            ScaleNormalizer() if (use_mediapipe and cache_dir is None) else None
+        )
 
         # 이미지 to 텐서
         self.to_tensor = transforms.Compose([
@@ -339,20 +359,33 @@ class ClothingDataset(Dataset):
             data = json.load(f)
 
         img_path = self._json_to_img_path(data, jpath)
-        image = cv2.imread(img_path)
-        if image is None:
-            image = np.full((TARGET_SIZE, TARGET_SIZE, 3), 128, dtype=np.uint8)
-
         meta = data.get("metadata.model", {})
         body_vec = normalize_body(meta)
         shoulder_width_cm = float(meta.get("metadata.model.shoulders_width", 39) or 39)
 
-        if self.scale_normalizer is not None:
-            image, _ = self.scale_normalizer(image, shoulder_width_cm)
+        # ── 이미지 로딩: 캐시 우선, 없으면 원본 처리 ──────────────────────
+        if self.cache_dir is not None:
+            cache_name = os.path.splitext(os.path.basename(jpath))[0] + ".npy"
+            cache_path = os.path.join(self.cache_dir, cache_name)
+            if os.path.exists(cache_path):
+                rgb = np.load(cache_path)   # RGB uint8 [H, W, 3]
+            else:
+                # 캐시 미스 — letterbox fallback
+                image = cv2.imread(img_path) if img_path else None
+                if image is None:
+                    image = np.full((TARGET_SIZE, TARGET_SIZE, 3), 128, dtype=np.uint8)
+                rgb = cv2.cvtColor(letterbox(image, TARGET_SIZE), cv2.COLOR_BGR2RGB)
         else:
-            image = letterbox(image, TARGET_SIZE)
+            image = cv2.imread(img_path) if img_path else None
+            if image is None:
+                image = np.full((TARGET_SIZE, TARGET_SIZE, 3), 128, dtype=np.uint8)
+            if self.scale_normalizer is not None:
+                image, _ = self.scale_normalizer(image, shoulder_width_cm)
+            else:
+                image = letterbox(image, TARGET_SIZE)
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # ──────────────────────────────────────────────────────────────────
 
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
         if self.aug:
             pil = self.aug(pil)
@@ -371,25 +404,25 @@ class ClothingDataset(Dataset):
 
         mask = torch.tensor(mask_np, dtype=torch.float32).unsqueeze(0)
 
-        # 옷 치수 정답
         clothes = extract_clothes_measurements(data)
         if clothes is None:
             clothes = torch.zeros(len(CLOTHES_KEYS), dtype=torch.float32)
 
         return {
-            "image":           image_tensor,
-            "body_vec":        body_vec,
-            "mask":            mask,
-            "clothes":         clothes,
-            "path":            jpath,
-            "model_type":      meta.get("metadata.model.type", ""),
+            "image":      image_tensor,
+            "body_vec":   body_vec,
+            "mask":       mask,
+            "clothes":    clothes,
+            "path":       jpath,
+            "model_type": meta.get("metadata.model.type", ""),
         }
 
 
-#DataLoader 생성
+# DataLoader 생성
 def get_dataloaders(
     json_dir: str,
     image_dir: str,
+    cache_dir: Optional[str] = None,          # ← 추가
     categories: List[str] = ["blouse"],
     view_type: str = "wear",
     use_mediapipe: bool = True,
@@ -404,6 +437,7 @@ def get_dataloaders(
         ds = ClothingDataset(
             json_dir=json_dir,
             image_dir=image_dir,
+            cache_dir=cache_dir,              # ← 추가
             categories=categories,
             view_type=view_type,
             use_mediapipe=use_mediapipe,
@@ -424,7 +458,7 @@ def get_dataloaders(
     return loaders
 
 
-#데이터 분포 확인용
+# 데이터 분포 확인용
 def compute_dataset_stats(json_dir: str, categories: List[str], view_type: str = "wear"):
     body_vals    = {k: [] for k in BODY_STATS}
     clothes_vals = {k: [] for k in CLOTHES_KEYS}
@@ -499,15 +533,11 @@ def compute_dataset_stats(json_dir: str, categories: List[str], view_type: str =
 if __name__ == "__main__":
     import sys, argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--json_dir",  type=str, default=None,
-                   help="JSON 라벨 디렉토리")
-    p.add_argument("--image_dir", type=str, default=None,
-                   help="이미지 디렉토리 (경로 확인용)")
-    p.add_argument("--categories", nargs="+", default=["blouse"],
-                   help="확인할 카테고리")
-    p.add_argument("--view_type", type=str, default="wear")
-
-    p.add_argument("--root", type=str, default=None)
+    p.add_argument("--json_dir",   type=str, default=None)
+    p.add_argument("--image_dir",  type=str, default=None)
+    p.add_argument("--categories", nargs="+", default=["blouse"])
+    p.add_argument("--view_type",  type=str, default="wear")
+    p.add_argument("--root",       type=str, default=None)
     args = p.parse_args()
 
     if args.root and not args.json_dir:

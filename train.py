@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from typing import Dict, Tuple
+from typing import Dict
 import logging
 
 from dataset import (
@@ -13,7 +13,8 @@ from dataset import (
 )
 from model import (
     ClothingMeasurementNet, BaselineMLP, NoFiLMModel,
-    SegOnlyModel, CombinedLoss
+    SegOnlyModel, CombinedLoss,
+    get_optimizer_phase1, get_optimizer_phase2,
 )
 
 logging.basicConfig(
@@ -23,44 +24,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-#Ablation 실험 설정
+# ────────────────────────────────────────────────────────────────────
+# Ablation 실험 설정
+# ────────────────────────────────────────────────────────────────────
 EXPERIMENTS = {
     1: {
-        "name":        "exp1_mlp_baseline",
-        "desc":        "수치 단독 MLP (이미지 없음)",
-        "model_cls":   BaselineMLP,
-        "mediapipe":   False,
-        "lambda1":     0.0,   # 세그멘테이션 loss 없음
-        "lambda2":     1.0,
+        "name":      "exp1_mlp_baseline",
+        "desc":      "수치 단독 MLP (이미지 없음)",
+        "model_cls": BaselineMLP,
+        "mediapipe": False,
+        "lambda1":   0.0,
+        "lambda2":   1.0,
     },
     2: {
-        "name":        "exp2_seg_no_norm",
-        "desc":        "세그멘테이션 + 회귀 (MediaPipe 정규화 없음)",
-        "model_cls":   SegOnlyModel,
-        "mediapipe":   False,  # 전처리 없음
-        "lambda1":     1.0,
-        "lambda2":     0.1,
+        "name":      "exp2_seg_no_norm",
+        "desc":      "세그멘테이션 + 회귀 (MediaPipe 정규화 없음)",
+        "model_cls": SegOnlyModel,
+        "mediapipe": False,
+        "lambda1":   1.0,
+        "lambda2":   0.1,
     },
     3: {
-        "name":        "exp3_no_film",
-        "desc":        "세그멘테이션 + 회귀 (FiLM 없음)",
-        "model_cls":   NoFiLMModel,
-        "mediapipe":   True,
-        "lambda1":     1.0,
-        "lambda2":     0.1,
+        "name":      "exp3_no_film",
+        "desc":      "세그멘테이션 + 회귀 (FiLM 없음)",
+        "model_cls": NoFiLMModel,
+        "mediapipe": True,
+        "lambda1":   1.0,
+        "lambda2":   0.1,
     },
     4: {
-        "name":        "exp4_full",
-        "desc":        "Full model (MediaPipe + FiLM + 세그멘테이션 + 회귀)",
-        "model_cls":   ClothingMeasurementNet,
-        "mediapipe":   True,
-        "lambda1":     1.0,
-        "lambda2":     0.1,
+        "name":      "exp4_full",
+        "desc":      "Full model (MediaPipe + FiLM + 세그멘테이션 + 회귀)",
+        "model_cls": ClothingMeasurementNet,
+        "mediapipe": True,
+        "lambda1":   1.0,
+        "lambda2":   0.5,
     },
 }
 
+PHASE1_EPOCHS = 10
 
-#평가 함수
+
+# ────────────────────────────────────────────────────────────────────
+# 평가 함수
+# ────────────────────────────────────────────────────────────────────
 def evaluate(
     model: torch.nn.Module,
     loader,
@@ -91,24 +98,23 @@ def evaluate(
             all_pred.append(meas_pred.cpu())
             all_gt.append(clothes.cpu())
 
-    all_pred = torch.cat(all_pred, dim=0)  # [N, 5]
-    all_gt   = torch.cat(all_gt,   dim=0)  # [N, 5]
+    all_pred = torch.cat(all_pred, dim=0)
+    all_gt   = torch.cat(all_gt,   dim=0)
 
-    # cm 단위로 변환 후 MAE/RMSE 계산
     pred_cm = denormalize_clothes(all_pred)
     gt_cm   = denormalize_clothes(all_gt)
 
-    mae_per_item  = (pred_cm - gt_cm).abs().mean(dim=0)   # [5]
-    rmse_per_item = ((pred_cm - gt_cm)**2).mean(dim=0).sqrt()
+    mae_per_item  = (pred_cm - gt_cm).abs().mean(dim=0)
+    rmse_per_item = ((pred_cm - gt_cm) ** 2).mean(dim=0).sqrt()
 
     item_names = [k.split(".")[-1] for k in CLOTHES_KEYS]
 
-    metrics = {
-        "total_loss":  total_loss  / max(n_batches, 1),
-        "seg_loss":    seg_loss_sum / max(n_batches, 1),
-        "meas_loss":   meas_loss_sum / max(n_batches, 1),
-        "mae_overall": mae_per_item.mean().item(),
-        "rmse_overall":rmse_per_item.mean().item(),
+    return {
+        "total_loss":   total_loss    / max(n_batches, 1),
+        "seg_loss":     seg_loss_sum  / max(n_batches, 1),
+        "meas_loss":    meas_loss_sum / max(n_batches, 1),
+        "mae_overall":  mae_per_item.mean().item(),
+        "rmse_overall": rmse_per_item.mean().item(),
         "mae_per_item": {
             name: mae_per_item[i].item()
             for i, name in enumerate(item_names)
@@ -118,10 +124,11 @@ def evaluate(
             for i, name in enumerate(item_names)
         },
     }
-    return metrics
 
 
-#학습 루프
+# ────────────────────────────────────────────────────────────────────
+# 학습 루프 (1 에폭)
+# ────────────────────────────────────────────────────────────────────
 def train_one_epoch(
     model: torch.nn.Module,
     loader,
@@ -146,9 +153,7 @@ def train_one_epoch(
         loss, sl, ml = criterion(seg_pred, mask_gt, meas_pred, clothes)
         loss.backward()
 
-        # Gradient clipping — 학습 안정성
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
 
         total_loss    += loss.item()
@@ -170,30 +175,63 @@ def train_one_epoch(
     }
 
 
+# ────────────────────────────────────────────────────────────────────
+# 헬퍼
+# ────────────────────────────────────────────────────────────────────
+def _log_epoch(epoch: int, train_metrics: Dict, val_metrics: Dict):
+    logger.info(
+        f"  Train Loss: {train_metrics['train_loss']:.4f}  "
+        f"Val Loss: {val_metrics['total_loss']:.4f}  "
+        f"Val MAE: {val_metrics['mae_overall']:.2f}cm"
+    )
+    logger.info("  Val MAE per item:")
+    for name, mae in val_metrics["mae_per_item"].items():
+        logger.info(f"    {name}: {mae:.2f}cm")
+
+
+def _maybe_save_best(model, optimizer, epoch, val_metrics, best_mae, ckpt_dir, args):
+    if val_metrics["mae_overall"] < best_mae:
+        best_mae = val_metrics["mae_overall"]
+        torch.save({
+            "epoch":       epoch,
+            "model_state": model.state_dict(),
+            "optimizer":   optimizer.state_dict(),
+            "best_mae":    best_mae,
+            "args":        vars(args),
+        }, os.path.join(ckpt_dir, "best.pth"))
+        logger.info(f"  ★ Best 모델 저장 (MAE={best_mae:.2f}cm)")
+    return best_mae
+
+
+# ────────────────────────────────────────────────────────────────────
 # 메인 학습 함수
+# ────────────────────────────────────────────────────────────────────
 def train(args):
-    exp_cfg = EXPERIMENTS[args.exp]
+    exp_cfg       = EXPERIMENTS[args.exp]
     use_mediapipe = exp_cfg["mediapipe"] and not args.no_mediapipe
-    exp_name = exp_cfg["name"] + ("_no_norm" if args.no_mediapipe else "")
+    exp_name      = exp_cfg["name"] + ("_no_norm" if args.no_mediapipe else "")
+    is_full_model = (exp_cfg["model_cls"] is ClothingMeasurementNet)
 
     logger.info(f"\n{'='*50}")
     logger.info(f"실험: {exp_name}")
     logger.info(f"설명: {exp_cfg['desc']}")
     logger.info(f"MediaPipe: {use_mediapipe}")
+    logger.info(f"cache_dir: {args.cache_dir}")
+    logger.info(f"Phase 학습: {is_full_model}")
     logger.info(f"{'='*50}\n")
 
     ckpt_dir   = os.path.join("checkpoints", exp_name)
-    result_dir = os.path.join("results", exp_name)
+    result_dir = os.path.join("results",     exp_name)
     os.makedirs(ckpt_dir,   exist_ok=True)
     os.makedirs(result_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    # DataLoader
     loaders = get_dataloaders(
         json_dir=args.json_dir,
         image_dir=args.image_dir,
+        cache_dir=args.cache_dir,        
         categories=args.categories,
         view_type=args.view_type,
         use_mediapipe=use_mediapipe,
@@ -203,14 +241,24 @@ def train(args):
         test_ratio=args.test_ratio,
         seed=args.seed,
     )
-    logger.info(f"Train: {len(loaders['train'].dataset)}  "
-                f"Val: {len(loaders['val'].dataset)}  "
-                f"Test: {len(loaders['test'].dataset)}")
+    logger.info(
+        f"Train: {len(loaders['train'].dataset)}  "
+        f"Val: {len(loaders['val'].dataset)}  "
+        f"Test: {len(loaders['test'].dataset)}"
+    )
 
-    model = exp_cfg["model_cls"](
-        body_dim=10,
-        num_measurements=5,
-    ).to(device)
+    if is_full_model:
+        model = exp_cfg["model_cls"](
+            body_dim=10,
+            num_measurements=5,
+            pretrained=True,
+        ).to(device)
+    else:
+        model = exp_cfg["model_cls"](
+            body_dim=10,
+            num_measurements=5,
+        ).to(device)
+
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"파라미터 수: {total_params:,}")
 
@@ -218,76 +266,95 @@ def train(args):
         lambda1=exp_cfg["lambda1"],
         lambda2=exp_cfg["lambda2"],
     )
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    #학습 루프
-    best_mae  = float("inf")
-    history   = []
+    best_mae = float("inf")
+    history  = []
 
-    for epoch in range(1, args.epochs + 1):
-        logger.info(f"\n[Epoch {epoch}/{args.epochs}]")
+    # ── Phase 학습 (ClothingMeasurementNet 전용) ──────────────────────
+    if is_full_model:
+        phase2_epochs = args.epochs
 
-        train_metrics = train_one_epoch(
-            model, loaders["train"], optimizer, criterion, device, epoch
+        logger.info(f"\n=== Phase 1: Encoder freeze ({PHASE1_EPOCHS} epochs) ===")
+        optimizer = get_optimizer_phase1(model, lr_decoder=1e-3)
+        scheduler = CosineAnnealingLR(optimizer, T_max=PHASE1_EPOCHS, eta_min=1e-5)
+
+        for epoch in range(1, PHASE1_EPOCHS + 1):
+            logger.info(f"\n[Phase1 Epoch {epoch}/{PHASE1_EPOCHS}]")
+            train_metrics = train_one_epoch(
+                model, loaders["train"], optimizer, criterion, device, epoch
+            )
+            val_metrics = evaluate(model, loaders["val"], criterion, device)
+            scheduler.step()
+            _log_epoch(epoch, train_metrics, val_metrics)
+            history.append({
+                **train_metrics,
+                **{f"val_{k}": v for k, v in val_metrics.items()},
+                "epoch": epoch, "phase": 1,
+            })
+            best_mae = _maybe_save_best(
+                model, optimizer, epoch, val_metrics, best_mae, ckpt_dir, args
+            )
+
+        logger.info(f"\n=== Phase 2: 전체 unfreeze ({phase2_epochs} epochs) ===")
+        optimizer = get_optimizer_phase2(model, lr_encoder=1e-4, lr_others=1e-3)
+        scheduler = CosineAnnealingLR(optimizer, T_max=phase2_epochs, eta_min=1e-6)
+
+        for epoch in range(PHASE1_EPOCHS + 1, PHASE1_EPOCHS + phase2_epochs + 1):
+            logger.info(f"\n[Phase2 Epoch {epoch}/{PHASE1_EPOCHS + phase2_epochs}]")
+            train_metrics = train_one_epoch(
+                model, loaders["train"], optimizer, criterion, device, epoch
+            )
+            val_metrics = evaluate(model, loaders["val"], criterion, device)
+            scheduler.step()
+            _log_epoch(epoch, train_metrics, val_metrics)
+            history.append({
+                **train_metrics,
+                **{f"val_{k}": v for k, v in val_metrics.items()},
+                "epoch": epoch, "phase": 2,
+            })
+            best_mae = _maybe_save_best(
+                model, optimizer, epoch, val_metrics, best_mae, ckpt_dir, args
+            )
+
+    # ── Ablation 단일 루프 ────────────────────────────────────────────
+    else:
+        optimizer = optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
         )
-        val_metrics = evaluate(model, loaders["val"], criterion, device)
-        scheduler.step()
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-        # if epoch == 1 and hasattr(loaders["train"].dataset, "scale_normalizer"):
-        #     norm = loaders["train"].dataset.scale_normalizer
-        #     if norm is not None:
-        #         rate = norm.success_rate()
-        #         logger.info(f"  MediaPipe 성공률: {rate*100:.1f}% "
-        #                     f"({norm.n_success}/{norm.n_total})")
-        #         if rate < 0.5:
-        #             logger.warning("성공률 50% 미만: letterbox fallback 비중 높음")
+        for epoch in range(1, args.epochs + 1):
+            logger.info(f"\n[Epoch {epoch}/{args.epochs}]")
+            train_metrics = train_one_epoch(
+                model, loaders["train"], optimizer, criterion, device, epoch
+            )
+            val_metrics = evaluate(model, loaders["val"], criterion, device)
+            scheduler.step()
+            _log_epoch(epoch, train_metrics, val_metrics)
+            history.append({
+                **train_metrics,
+                **{f"val_{k}": v for k, v in val_metrics.items()},
+                "epoch": epoch,
+            })
+            best_mae = _maybe_save_best(
+                model, optimizer, epoch, val_metrics, best_mae, ckpt_dir, args
+            )
 
-        # 로그
-        logger.info(
-            f"  Train Loss: {train_metrics['train_loss']:.4f}  "
-            f"Val Loss: {val_metrics['total_loss']:.4f}  "
-            f"Val MAE: {val_metrics['mae_overall']:.2f}cm"
-        )
-        logger.info("  Val MAE per item:")
-        for name, mae in val_metrics["mae_per_item"].items():
-            logger.info(f"    {name}: {mae:.2f}cm")
-
-        # 체크포인트 저장
-        row = {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}, "epoch": epoch}
-        history.append(row)
-
-        if val_metrics["mae_overall"] < best_mae:
-            best_mae = val_metrics["mae_overall"]
-            torch.save({
-                "epoch":      epoch,
-                "model_state": model.state_dict(),
-                "optimizer":  optimizer.state_dict(),
-                "best_mae":   best_mae,
-                "args":       vars(args),
-            }, os.path.join(ckpt_dir, "best.pth"))
-            logger.info(f"Best 모델 저장 (MAE={best_mae:.2f}cm)")
-
-    #테스트 평가
+    # ── 테스트 평가 ───────────────────────────────────────────────────
     logger.info("\n[Test 평가]")
     ckpt = torch.load(os.path.join(ckpt_dir, "best.pth"), map_location=device)
     model.load_state_dict(ckpt["model_state"])
     test_metrics = evaluate(model, loaders["test"], criterion, device)
 
-    logger.info(f"Test MAE: {test_metrics['mae_overall']:.2f}cm")
+    logger.info(f"Test MAE:  {test_metrics['mae_overall']:.2f}cm")
     logger.info(f"Test RMSE: {test_metrics['rmse_overall']:.2f}cm")
     logger.info("Test MAE per item:")
     for name, mae in test_metrics["mae_per_item"].items():
         logger.info(f"  {name}: {mae:.2f}cm")
 
-    # 결과 저장
     results = {
-        "exp_name":    exp_name,
-        "exp_desc":    exp_cfg["desc"],
+        "exp_name":     exp_name,
+        "exp_desc":     exp_cfg["desc"],
         "best_val_mae": best_mae,
         "test_metrics": test_metrics,
         "history":      history,
@@ -300,7 +367,9 @@ def train(args):
     return results
 
 
-#Ablation 전체 실행 함수
+# ────────────────────────────────────────────────────────────────────
+# Ablation 전체 실행
+# ────────────────────────────────────────────────────────────────────
 def run_all_ablations(args):
     all_results = {}
     for exp_id in [1, 2, 3, 4]:
@@ -311,11 +380,13 @@ def run_all_ablations(args):
         result = train(args)
         all_results[exp_id] = result
 
-    # 비교 테이블 출력
     print("\n" + "="*60)
     print("Ablation 결과 비교 (Test MAE, cm)")
     print("="*60)
-    header = f"{'실험':<35} {'전체MAE':>8} {'어깨':>8} {'총장':>8} {'가슴':>8} {'소매':>8}"
+    header = (
+        f"{'실험':<35} {'전체MAE':>8} "
+        f"{'어깨':>8} {'총장':>8} {'가슴':>8} {'소매':>8}"
+    )
     print(header)
     print("-"*60)
 
@@ -331,40 +402,40 @@ def run_all_ablations(args):
         print(row)
     print("="*60)
 
+
+# ────────────────────────────────────────────────────────────────────
+# argparse
+# ────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(description="의류 치수 추정 모델 학습")
-    p.add_argument("--json_dir",    type=str, required=True,
-                   help="JSON 라벨 디렉토리 (예: /data/.../label_blouse)")
-    p.add_argument("--image_dir",   type=str, required=True,
-                   help="이미지 디렉토리 (예: /data/.../image_blouse)")
-    p.add_argument("--exp",         type=int,   default=4, choices=[1,2,3,4],
-                   help="실험 번호 (1=MLP, 2=세그no정규화, 3=FiLM없음, 4=Full)")
-    p.add_argument("--all",         action="store_true",
-                   help="Exp 1~4 전체 Ablation 순차 실행")
-    p.add_argument("--no_mediapipe",action="store_true",
-                   help="MediaPipe 스케일 정규화 비활성화 (Ablation용)")
-    p.add_argument("--categories",  nargs="+",  default=["blouse", "coat", "shirt"],
-                   help="학습할 의류 카테고리")
-    p.add_argument("--view_type",   type=str,   default="front",
-                   choices=["front", "wear", "all"],
-                   help="사용할 이미지 각도 타입")
-    p.add_argument("--epochs",      type=int,   default=30)
-    p.add_argument("--batch_size",  type=int,   default=16)
-    p.add_argument("--lr",          type=float, default=1e-4)
-    p.add_argument("--weight_decay",type=float, default=1e-4)
-    p.add_argument("--num_workers", type=int,   default=4)
-    p.add_argument("--val_ratio",   type=float, default=0.1)
-    p.add_argument("--test_ratio",  type=float, default=0.1)
-    p.add_argument("--seed",        type=int,   default=42)
-    p.add_argument("--eval_only",   action="store_true",
-                   help="체크포인트 로드 후 val/test 평가만 실행")
-    p.add_argument("--body_ablation", action="store_true",
-                   help="신체치수 피처 하나씩 마스킹해 중요도 측정")
-    p.add_argument("--ckpt",        type=str,   default=None,
-                   help="--eval_only / --body_ablation 시 사용할 .pth 경로 (미지정 시 checkpoints/{exp}/best.pth)")
+    p.add_argument("--json_dir",     type=str, required=True)
+    p.add_argument("--image_dir",    type=str, required=True)
+    p.add_argument("--cache_dir",    type=str, default=None,      # ← 추가
+                   help="preprocess_cache.py로 생성한 .npy 캐시 디렉토리 "
+                        "(지정 시 MediaPipe를 학습 중 실행하지 않음)")
+    p.add_argument("--exp",          type=int,   default=4, choices=[1, 2, 3, 4])
+    p.add_argument("--all",          action="store_true")
+    p.add_argument("--no_mediapipe", action="store_true")
+    p.add_argument("--categories",   nargs="+", default=["blouse", "coat", "shirt"])
+    p.add_argument("--view_type",    type=str,  default="front",
+                   choices=["front", "wear", "all"])
+    p.add_argument("--epochs",       type=int,  default=50)
+    p.add_argument("--batch_size",   type=int,  default=16)
+    p.add_argument("--lr",           type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--num_workers",  type=int,  default=4)
+    p.add_argument("--val_ratio",    type=float, default=0.1)
+    p.add_argument("--test_ratio",   type=float, default=0.1)
+    p.add_argument("--seed",         type=int,  default=42)
+    p.add_argument("--eval_only",    action="store_true")
+    p.add_argument("--body_ablation", action="store_true")
+    p.add_argument("--ckpt",         type=str,  default=None)
     return p.parse_args()
 
 
+# ────────────────────────────────────────────────────────────────────
+# 신체치수 피처 중요도 ablation
+# ────────────────────────────────────────────────────────────────────
 BODY_FEATURE_NAMES = [
     "body_height", "breast_size_female", "waist_size", "hip_seize",
     "shoulders_width", "arm_length", "waist_height", "back_length",
@@ -372,8 +443,7 @@ BODY_FEATURE_NAMES = [
 ]
 
 
-def evaluate_masked(model, loader, criterion, device, mask_idx: int) -> float:
-    #body_vec의 mask_idx 번째 피처를 0으로 마스킹한 뒤 MAE 반환
+def evaluate_masked(model, loader, criterion, device, mask_idx: int):
     model.eval()
     all_pred, all_gt = [], []
     with torch.no_grad():
@@ -381,7 +451,6 @@ def evaluate_masked(model, loader, criterion, device, mask_idx: int) -> float:
             image    = batch["image"].to(device)
             body_vec = batch["body_vec"].to(device).clone()
             body_vec[:, mask_idx] = 0.0
-            mask_gt  = batch["mask"].to(device)
             clothes  = batch["clothes"].to(device)
 
             _, meas_pred = model(image, body_vec)
@@ -397,7 +466,6 @@ def evaluate_masked(model, loader, criterion, device, mask_idx: int) -> float:
 
 
 def body_ablation(args):
-    #각 신체치수 피처를 하나씩 0으로 마스킹해 MAE 변화 측정
     exp_cfg   = EXPERIMENTS[args.exp]
     exp_name  = exp_cfg["name"] + ("_no_norm" if args.no_mediapipe else "")
     ckpt_path = args.ckpt or os.path.join("checkpoints", exp_name, "best.pth")
@@ -407,6 +475,7 @@ def body_ablation(args):
     loaders = get_dataloaders(
         json_dir=args.json_dir,
         image_dir=args.image_dir,
+        cache_dir=args.cache_dir,
         categories=args.categories,
         view_type=args.view_type,
         use_mediapipe=False,
@@ -417,24 +486,32 @@ def body_ablation(args):
         seed=args.seed,
     )
 
-    model = exp_cfg["model_cls"](body_dim=10, num_measurements=5).to(device)
+    is_full = (exp_cfg["model_cls"] is ClothingMeasurementNet)
+    if is_full:
+        model = exp_cfg["model_cls"](body_dim=10, num_measurements=5,
+                                     pretrained=False).to(device)
+    else:
+        model = exp_cfg["model_cls"](body_dim=10, num_measurements=5).to(device)
+
     ckpt  = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     criterion = CombinedLoss(lambda1=exp_cfg["lambda1"], lambda2=exp_cfg["lambda2"])
 
-    # 베이스라인 (마스킹 없음)
-    base = evaluate(model, loaders["test"], criterion, device)
-    base_mae     = base["mae_overall"]
-    base_per     = list(base["mae_per_item"].values())
+    base          = evaluate(model, loaders["test"], criterion, device)
+    base_mae      = base["mae_overall"]
+    base_per      = list(base["mae_per_item"].values())
     clothes_names = list(base["mae_per_item"].keys())
 
     print(f"\n{'='*65}")
     print(f"신체치수 피처 Ablation  (exp={exp_name}, test set)")
     print(f"{'='*65}")
-    header = f"{'피처':<22} {'전체MAE':>8} {'Δ':>7}  " + "  ".join(f"{n[:6]:>7}" for n in clothes_names)
+    header = (
+        f"{'피처':<22} {'전체MAE':>8} {'Δ':>7}  "
+        + "  ".join(f"{n[:6]:>7}" for n in clothes_names)
+    )
     print(header)
-    print(f"  {'[baseline]':<20} {base_mae:>8.2f}{'':>8}  " +
-          "  ".join(f"{v:>7.2f}" for v in base_per))
+    print(f"  {'[baseline]':<20} {base_mae:>8.2f}{'':>8}  "
+          + "  ".join(f"{v:>7.2f}" for v in base_per))
     print("-"*65)
 
     results = []
@@ -442,8 +519,8 @@ def body_ablation(args):
         mae, per = evaluate_masked(model, loaders["test"], criterion, device, mask_idx=i)
         delta = mae - base_mae
         results.append((delta, feat_name, mae, per))
-        print(f"  {feat_name:<20} {mae:>8.2f} {delta:>+7.2f}  " +
-              "  ".join(f"{v:>7.2f}" for v in per))
+        print(f"  {feat_name:<20} {mae:>8.2f} {delta:>+7.2f}  "
+              + "  ".join(f"{v:>7.2f}" for v in per))
 
     print(f"{'='*65}")
     results.sort(reverse=True)
@@ -454,8 +531,8 @@ def body_ablation(args):
 
 
 def eval_only(args):
-    exp_cfg  = EXPERIMENTS[args.exp]
-    exp_name = exp_cfg["name"] + ("_no_norm" if args.no_mediapipe else "")
+    exp_cfg   = EXPERIMENTS[args.exp]
+    exp_name  = exp_cfg["name"] + ("_no_norm" if args.no_mediapipe else "")
     ckpt_path = args.ckpt or os.path.join("checkpoints", exp_name, "best.pth")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -464,6 +541,7 @@ def eval_only(args):
     loaders = get_dataloaders(
         json_dir=args.json_dir,
         image_dir=args.image_dir,
+        cache_dir=args.cache_dir,
         categories=args.categories,
         view_type=args.view_type,
         use_mediapipe=False,
@@ -474,8 +552,14 @@ def eval_only(args):
         seed=args.seed,
     )
 
-    model = exp_cfg["model_cls"](body_dim=10, num_measurements=5).to(device)
-    ckpt  = torch.load(ckpt_path, map_location=device)
+    is_full = (exp_cfg["model_cls"] is ClothingMeasurementNet)
+    if is_full:
+        model = exp_cfg["model_cls"](body_dim=10, num_measurements=5,
+                                     pretrained=False).to(device)
+    else:
+        model = exp_cfg["model_cls"](body_dim=10, num_measurements=5).to(device)
+
+    ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     logger.info(f"epoch {ckpt['epoch']} 체크포인트 로드")
 
@@ -483,11 +567,18 @@ def eval_only(args):
 
     for split in ["val", "test"]:
         m = evaluate(model, loaders[split], criterion, device)
-        logger.info(f"\n[{split.upper()}]  MAE={m['mae_overall']:.2f}cm  RMSE={m['rmse_overall']:.2f}cm")
+        logger.info(
+            f"\n[{split.upper()}]  "
+            f"MAE={m['mae_overall']:.2f}cm  "
+            f"RMSE={m['rmse_overall']:.2f}cm"
+        )
         for name, mae in m["mae_per_item"].items():
             logger.info(f"  {name}: {mae:.2f}cm")
 
 
+# ────────────────────────────────────────────────────────────────────
+# 진입점
+# ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     args = parse_args()
     if args.body_ablation:
