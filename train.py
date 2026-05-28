@@ -8,12 +8,19 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Dict, Tuple
 import logging
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from dataset import (
     get_dataloaders, denormalize_clothes, CLOTHES_KEYS
 )
 from model import (
-    ClothingMeasurementNet, BaselineMLP, NoFiLMModel,
-    SegOnlyModel, CombinedLoss
+    ClothingMeasurementNet, ClothingMeasurementNetCA,
+    ClothingMeasurementNetQFormer,
+    BaselineMLP, NoFiLMModel, CombinedLoss
 )
 
 logging.basicConfig(
@@ -26,36 +33,52 @@ logger = logging.getLogger(__name__)
 #Ablation 실험 설정
 EXPERIMENTS = {
     1: {
-        "name":        "exp1_mlp_baseline",
-        "desc":        "수치 단독 MLP (이미지 없음)",
-        "model_cls":   BaselineMLP,
-        "mediapipe":   False,
-        "lambda1":     0.0,   # 세그멘테이션 loss 없음
-        "lambda2":     1.0,
+        "name":      "exp1_mlp_baseline",
+        "desc":      "Exp1: 신체 치수만 입력 (MLP Baseline, 이미지 없음)",
+        "model_cls": BaselineMLP,
+        "mediapipe": False,
+        "lambda1":   0.0,   # 세그멘테이션 loss 없음
+        "lambda2":   1.0,
     },
     2: {
-        "name":        "exp2_seg_no_norm",
-        "desc":        "세그멘테이션 + 회귀 (MediaPipe 정규화 없음)",
-        "model_cls":   SegOnlyModel,
-        "mediapipe":   False,  # 전처리 없음
-        "lambda1":     1.0,
-        "lambda2":     0.1,
+        "name":      "exp2_image_only",
+        "desc":      "Exp2: 이미지만 입력 (신체 정보 완전 제거, FiLM 없음)",
+        "model_cls": NoFiLMModel,
+        "mediapipe": False,
+        "lambda1":   1.0,
+        "lambda2":   0.1,
     },
     3: {
-        "name":        "exp3_no_film",
-        "desc":        "세그멘테이션 + 회귀 (FiLM 없음)",
-        "model_cls":   NoFiLMModel,
-        "mediapipe":   True,
-        "lambda1":     1.0,
-        "lambda2":     0.1,
+        "name":      "exp3_image_body_concat",
+        "desc":      "Exp3: 이미지 + body concat (FiLM 없음)",
+        "model_cls": NoFiLMModel,
+        "mediapipe": False,
+        "lambda1":   1.0,
+        "lambda2":   0.1,
     },
     4: {
-        "name":        "exp4_full",
-        "desc":        "Full model (MediaPipe + FiLM + 세그멘테이션 + 회귀)",
-        "model_cls":   ClothingMeasurementNet,
-        "mediapipe":   True,
-        "lambda1":     1.0,
-        "lambda2":     0.1,
+        "name":      "exp4_backbone",
+        "desc":      "Exp4: Full model (이미지 + body + FiLM)",
+        "model_cls": ClothingMeasurementNet,
+        "mediapipe": False,
+        "lambda1":   1.0,
+        "lambda2":   0.1,
+    },
+    5: {
+        "name":      "exp5_cross_attn",
+        "desc":      "Exp5: Cross-Attention 조건화 (FiLM → BodyCrossAttention)",
+        "model_cls": ClothingMeasurementNetCA,
+        "mediapipe": False,
+        "lambda1":   1.0,
+        "lambda2":   0.1,
+    },
+    6: {
+        "name":      "exp6_qformer",
+        "desc":      "Exp6: Q-Former 헤드 (치수별 전담 쿼리 토큰)",
+        "model_cls": ClothingMeasurementNetQFormer,
+        "mediapipe": False,
+        "lambda1":   1.0,
+        "lambda2":   0.1,
     },
 }
 
@@ -190,6 +213,17 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
+    # wandb 초기화
+    use_wandb = WANDB_AVAILABLE and args.wandb_project is not None
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run or exp_name,
+            config={**vars(args), "exp_desc": exp_cfg["desc"]},
+        )
+    elif args.wandb_project:
+        logger.warning("wandb 미설치")
+
     # DataLoader
     loaders = get_dataloaders(
         json_dir=args.json_dir,
@@ -261,16 +295,39 @@ def train(args):
         row = {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}, "epoch": epoch}
         history.append(row)
 
+        ckpt_payload = {
+            "epoch":       epoch,
+            "model_state": model.state_dict(),
+            "optimizer":   optimizer.state_dict(),
+            "best_mae":    best_mae,
+            "args":        vars(args),
+        }
+
         if val_metrics["mae_overall"] < best_mae:
             best_mae = val_metrics["mae_overall"]
-            torch.save({
-                "epoch":      epoch,
-                "model_state": model.state_dict(),
-                "optimizer":  optimizer.state_dict(),
-                "best_mae":   best_mae,
-                "args":       vars(args),
-            }, os.path.join(ckpt_dir, "best.pth"))
+            ckpt_payload["best_mae"] = best_mae
+            torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pth"))
             logger.info(f"Best 모델 저장 (MAE={best_mae:.2f}cm)")
+
+        if epoch % args.ckpt_interval == 0:
+            torch.save(ckpt_payload, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
+            logger.info(f"  체크포인트 저장: epoch_{epoch:03d}.pth")
+
+        #wandb 로깅
+        if use_wandb:
+            log_dict = {
+                "epoch":           epoch,
+                "train/loss":      train_metrics["train_loss"],
+                "train/seg_loss":  train_metrics["train_seg_loss"],
+                "train/meas_loss": train_metrics["train_meas_loss"],
+                "val/loss":        val_metrics["total_loss"],
+                "val/mae":         val_metrics["mae_overall"],
+                "val/rmse":        val_metrics["rmse_overall"],
+                "lr":              scheduler.get_last_lr()[0],
+            }
+            for name, mae in val_metrics["mae_per_item"].items():
+                log_dict[f"val/mae_{name}"] = mae
+            wandb.log(log_dict)
 
     #테스트 평가
     logger.info("\n[Test 평가]")
@@ -286,8 +343,8 @@ def train(args):
 
     # 결과 저장
     results = {
-        "exp_name":    exp_name,
-        "exp_desc":    exp_cfg["desc"],
+        "exp_name":     exp_name,
+        "exp_desc":     exp_cfg["desc"],
         "best_val_mae": best_mae,
         "test_metrics": test_metrics,
         "history":      history,
@@ -296,6 +353,16 @@ def train(args):
     with open(os.path.join(result_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     logger.info(f"\n결과 저장: {result_dir}/metrics.json")
+
+    if use_wandb:
+        test_log = {
+            "test/mae":  test_metrics["mae_overall"],
+            "test/rmse": test_metrics["rmse_overall"],
+        }
+        for name, mae in test_metrics["mae_per_item"].items():
+            test_log[f"test/mae_{name}"] = mae
+        wandb.log(test_log)
+        wandb.finish()
 
     return results
 
@@ -337,7 +404,7 @@ def parse_args():
                    help="JSON 라벨 디렉토리 (예: /data/.../label_blouse)")
     p.add_argument("--image_dir",   type=str, required=True,
                    help="이미지 디렉토리 (예: /data/.../image_blouse)")
-    p.add_argument("--exp",         type=int,   default=4, choices=[1,2,3,4],
+    p.add_argument("--exp",         type=int,   default=4, choices=[1,2,3,4,5,6],
                    help="실험 번호 (1=MLP, 2=세그no정규화, 3=FiLM없음, 4=Full)")
     p.add_argument("--all",         action="store_true",
                    help="Exp 1~4 전체 Ablation 순차 실행")
@@ -362,6 +429,12 @@ def parse_args():
                    help="신체치수 피처 하나씩 마스킹해 중요도 측정")
     p.add_argument("--ckpt",        type=str,   default=None,
                    help="--eval_only / --body_ablation 시 사용할 .pth 경로 (미지정 시 checkpoints/{exp}/best.pth)")
+    p.add_argument("--wandb_project", type=str, default=None,
+                   help="W&B 프로젝트 이름 (미지정 시 W&B 비활성화)")
+    p.add_argument("--wandb_run",   type=str,   default=None,
+                   help="W&B run 이름 (미지정 시 exp_name 사용)")
+    p.add_argument("--ckpt_interval", type=int, default=10,
+                   help="N 에폭마다 체크포인트 저장 (기본 10)")
     return p.parse_args()
 
 
