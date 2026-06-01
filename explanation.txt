@@ -1,0 +1,17 @@
+!python stats_analysis.py \
+  --json_dirs /content/label_blouse,/content/label_shirt \
+  --categories blouse,shirt \
+  --view_type wear
+
+위 실행코드 먼저 실행
+결과로 나온 것들 dataset.py 에 복붙
+그 다음 아래 코드 실행
+
+!python AI-Application/train.py --exp 6 \
+  --json_dirs /content/label_blouse /content/label_shirt \
+  --image_dirs /content/image_blouse /content/image_shirt \
+  --categories blouse shirt \
+  --view_type wear \
+  --no_mediapipe \
+  --epochs 60 \
+  --wandb_project clothing-ablation
