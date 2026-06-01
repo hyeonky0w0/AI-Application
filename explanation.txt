@@ -1,0 +1,9 @@
+!python train_orig_multi.py --exp 6 \
+  --json_dirs /content/label_blouse /content/label_shirt \
+  --image_dirs /content/image_blouse /content/image_shirt \
+  --view_type wear \
+  --no_mediapipe \
+  --epochs 60 \
+  --wandb_project clothing-ablation
+
+바로 실행
