@@ -61,6 +61,14 @@ class BodyCrossAttention(nn.Module):
         return out.permute(0, 2, 1).reshape(B, C, H, W)
 
 
+class IdentityConditioning(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def forward(self, feature: torch.Tensor, body_vec: torch.Tensor) -> torch.Tensor:
+        return feature
+
+
 class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
         super().__init__()
@@ -83,7 +91,7 @@ class ConvBlock(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, body_dim: int, pretrained: bool = True,
-                 use_cross_attn: bool = False):
+                 use_cross_attn: bool = False, use_film: bool = True):
         super().__init__()
         weights  = ResNet50_Weights.DEFAULT if pretrained else None
         backbone = models.resnet50(weights=weights)
@@ -95,32 +103,40 @@ class Encoder(nn.Module):
         self.enc4 = backbone.layer3   # 1024ch
         self.enc5 = backbone.layer4   # 2048ch
 
-        # FiLM / CrossAttention 중 하나를 cond3/4/5로 통일
-        # → forward 코드는 동일하게 유지 (둘 다 (feature, body_vec) → feature)
-        cond_cls = BodyCrossAttention if use_cross_attn else FiLM
+        if use_cross_attn:
+            cond_cls = BodyCrossAttention
+        elif use_film:
+            cond_cls = FiLM
+        else:
+            cond_cls = IdentityConditioning
         self.cond3 = cond_cls(512,  body_dim)
         self.cond4 = cond_cls(1024, body_dim)
         self.cond5 = cond_cls(2048, body_dim)
 
     def forward(self, x: torch.Tensor, body_vec: torch.Tensor):
-        e1 = self.enc1(x)                                    # [B,   64, 112, 112]
-        e2 = self.enc2(self.pool(e1))                        # [B,  256,  56,  56]
-        e3 = self.cond3(self.enc3(e2), body_vec)             # [B,  512,  28,  28]
-        e4 = self.cond4(self.enc4(e3), body_vec)             # [B, 1024,  14,  14]
-        e5 = self.cond5(self.enc5(e4), body_vec)             # [B, 2048,   7,   7]
+        e1 = self.enc1(x)                         
+        e2 = self.enc2(self.pool(e1))             
+        e3 = self.cond3(self.enc3(e2), body_vec)  
+        e4 = self.cond4(self.enc4(e3), body_vec)  
+        e5 = self.cond5(self.enc5(e4), body_vec)  
         return e1, e2, e3, e4, e5
 
 
 class Bottleneck(nn.Module):
     def __init__(self, body_dim: int, dropout: float = 0.2,
-                 use_cross_attn: bool = False):
+                 use_cross_attn: bool = False, use_film: bool = True):
         super().__init__()
         self.block = ConvBlock(2048, 1024, dropout=dropout)
-        cond_cls   = BodyCrossAttention if use_cross_attn else FiLM
+        if use_cross_attn:
+            cond_cls = BodyCrossAttention
+        elif use_film:
+            cond_cls = FiLM
+        else:
+            cond_cls = IdentityConditioning
         self.cond  = cond_cls(1024, body_dim)
 
     def forward(self, x: torch.Tensor, body_vec: torch.Tensor) -> torch.Tensor:
-        return self.cond(self.block(x), body_vec)            # [B, 1024, 7, 7]
+        return self.cond(self.block(x), body_vec)   
 
 
 class Decoder(nn.Module):
@@ -144,11 +160,11 @@ class Decoder(nn.Module):
         self.seg_head = nn.Conv2d(32, 1, 1)
 
     def forward(self, neck, e1, e2, e3, e4):
-        d4 = self.dec4(torch.cat([self.up4(neck), e4], dim=1))  # [B, 512, 14,  14]
-        d3 = self.dec3(torch.cat([self.up3(d4),   e3], dim=1))  # [B, 256, 28,  28]
-        d2 = self.dec2(torch.cat([self.up2(d3),   e2], dim=1))  # [B, 128, 56,  56]
-        d1 = self.dec1(torch.cat([self.up1(d2),   e1], dim=1))  # [B,  64, 112, 112]
-        d0 = self.dec0(self.up0(d1))                             # [B,  32, 224, 224]
+        d4 = self.dec4(torch.cat([self.up4(neck), e4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4),   e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3),   e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2),   e1], dim=1))
+        d0 = self.dec0(self.up0(d1))                          
         seg = torch.sigmoid(self.seg_head(d0))
         return seg, d1
 
@@ -183,22 +199,6 @@ class RegressionHead(nn.Module):
 
 
 class MeasurementQueryTransformer(nn.Module):
-    """
-    BLIP-2 Q-Former 아이디어를 의류 치수 예측에 적용한 회귀 헤드.
-
-    핵심 개념:
-      - 치수마다 전담 쿼리 토큰 1개씩 (총 5개)
-      - 각 쿼리가 이미지 패치 + body 토큰에서 필요한 정보를 독립적으로 추출
-      - 쿼리들 간 Self-Attention으로 측정치 간 상관관계도 학습
-        (예: 가슴이 크면 허리도 크다는 패턴)
-
-    Transformer Decoder 블록 (num_layers회 반복):
-      ① Self-Attention  : 쿼리 5개 ↔ 쿼리 5개  (치수 간 상관관계)
-      ② Cross-Attention : 쿼리 5개 →  이미지 토큰 + body 토큰
-      ③ FFN
-
-    RegressionHead와 동일한 인터페이스 (forward 시그니처 동일).
-    """
     def __init__(self, feat_dim: int = 64, body_dim: int = 10,
                  num_measurements: int = 5, num_heads: int = 4,
                  num_layers: int = 2, dropout: float = 0.1):
@@ -206,19 +206,13 @@ class MeasurementQueryTransformer(nn.Module):
         self.body_dim        = body_dim
         self.num_measurements = num_measurements
 
-        # 치수별 전담 쿼리 토큰 (학습 가능한 파라미터)
-        # 마치 "어깨 담당 탐정", "소매 담당 탐정" …
         self.meas_queries = nn.Parameter(torch.randn(num_measurements, feat_dim))
         nn.init.trunc_normal_(self.meas_queries, std=0.02)
 
-        # body_vec → body 토큰 변환
-        # BodyCrossAttention과 동일: 위치(어떤 치수?) + 수치(얼마?)
-        self.body_pos_embed = nn.Embedding(body_dim, feat_dim)
-        self.body_val_embed = nn.Linear(1, feat_dim)
+        if body_dim > 0:
+            self.body_pos_embed = nn.Embedding(body_dim, feat_dim)
+            self.body_val_embed = nn.Linear(1, feat_dim)
 
-        # Transformer Decoder
-        # tgt  = 쿼리 5개    [B, 5, feat_dim]
-        # mem  = 이미지+body [B, H*W + body_dim, feat_dim]
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=feat_dim,
             nhead=num_heads,
@@ -238,48 +232,40 @@ class MeasurementQueryTransformer(nn.Module):
                 seg_mask: torch.Tensor = None) -> torch.Tensor:
         B = seg_feat.shape[0]
 
-        # ── 이미지 패치 토큰 ───────────────────────────────────
-        # [B, 64, 112, 112] → [B, 12544, 64]
         img_tokens = seg_feat.flatten(2).permute(0, 2, 1)
 
-        # seg_mask로 옷 영역 토큰을 강조 (mask=1인 위치 가중치 +1)
+        # seg_mask로 옷 영역 토큰 강조
         if seg_mask is not None:
             w = F.interpolate(seg_mask, size=seg_feat.shape[2:],
                               mode='bilinear', align_corners=False)
             img_tokens = img_tokens * (1.0 + w.flatten(2).permute(0, 2, 1))
 
-        # ── body 토큰 ─────────────────────────────────────────
-        # [B, 10] → [B, 10, 64]
-        idx        = torch.arange(self.body_dim, device=body_vec.device)
-        pos_emb    = self.body_pos_embed(idx)                    # [10, 64]
-        val_emb    = self.body_val_embed(body_vec.unsqueeze(-1)) # [B, 10, 64]
-        body_tokens = val_emb + pos_emb                          # [B, 10, 64]
+        if self.body_dim > 0:
+            idx         = torch.arange(self.body_dim, device=body_vec.device)
+            pos_emb     = self.body_pos_embed(idx)                    
+            val_emb     = self.body_val_embed(body_vec.unsqueeze(-1)) 
+            body_tokens = val_emb + pos_emb                           
+            context = torch.cat([img_tokens, body_tokens], dim=1)     
+        else:
+            context = img_tokens                                     
 
-        # ── 컨텍스트 = 이미지 + body ───────────────────────────
-        # [B, 12544 + 10, 64]
-        context = torch.cat([img_tokens, body_tokens], dim=1)
-
-        # ── 쿼리 초기화 ───────────────────────────────────────
-        # [B, 5, 64]  — 배치 전체에 동일한 초기 쿼리
         queries = self.meas_queries.unsqueeze(0).expand(B, -1, -1)
 
-        # ── Transformer Decoder ───────────────────────────────
-        # ① Self-Attn : 5개 쿼리끼리 대화
-        # ② Cross-Attn: 각 쿼리가 context(이미지+body)에서 정보 추출
-        out = self.transformer(queries, context)  # [B, 5, 64]
+        out = self.transformer(queries, context)  
 
-        meas = self.head(out).squeeze(-1)          # [B, 5]
+        meas = self.head(out).squeeze(-1)          
         return meas
 
 
 class ClothingMeasurementNet(nn.Module):
     def __init__(self, body_dim: int = 10, num_measurements: int = 5,
                  pretrained: bool = True, use_cross_attn: bool = False,
-                 head_type: str = "attn"):
+                 use_film: bool = True, head_type: str = "attn"):
         super().__init__()
         self.encoder    = Encoder(body_dim, pretrained=pretrained,
-                                  use_cross_attn=use_cross_attn)
-        self.bottleneck = Bottleneck(body_dim, use_cross_attn=use_cross_attn)
+                                  use_cross_attn=use_cross_attn, use_film=use_film)
+        self.bottleneck = Bottleneck(body_dim, use_cross_attn=use_cross_attn,
+                                     use_film=use_film)
         self.decoder    = Decoder()
 
         if head_type == "qformer":
@@ -299,17 +285,36 @@ class ClothingMeasurementNet(nn.Module):
 
 
 class ClothingMeasurementNetCA(ClothingMeasurementNet):
+    """Cross-Attention 버전 (Exp5)."""
     def __init__(self, body_dim: int = 10, num_measurements: int = 5,
                  pretrained: bool = True):
         super().__init__(body_dim, num_measurements, pretrained,
-                         use_cross_attn=True, head_type="attn")
+                         use_cross_attn=True, use_film=True, head_type="attn")
 
 
 class ClothingMeasurementNetQFormer(ClothingMeasurementNet):
+    """Full model: FiLM + Q-Former 헤드 (Exp6, 최종 모델)."""
     def __init__(self, body_dim: int = 10, num_measurements: int = 5,
                  pretrained: bool = True):
         super().__init__(body_dim, num_measurements, pretrained,
-                         use_cross_attn=False, head_type="qformer")
+                         use_cross_attn=False, use_film=True, head_type="qformer")
+
+
+class ImageOnlyQFormerModel(ClothingMeasurementNet):
+    """Exp2: 이미지만, body 무시, FiLM 없음, Q-Former 헤드."""
+    def __init__(self, body_dim: int = 10, num_measurements: int = 5,
+                 pretrained: bool = True):
+        super().__init__(0, num_measurements, pretrained,
+                         use_cross_attn=False, use_film=False, head_type="qformer")
+
+
+class ImageBodyNoFiLMQFormerModel(ClothingMeasurementNet):
+    """Exp3: 이미지 + body, FiLM 없음, Q-Former 헤드."""
+    def __init__(self, body_dim: int = 10, num_measurements: int = 5,
+                 pretrained: bool = True):
+        super().__init__(body_dim, num_measurements, pretrained,
+                         use_cross_attn=False, use_film=False, head_type="qformer")
+
 
 class CombinedLoss(nn.Module):
     def __init__(self, lambda1: float = 1.0, lambda2: float = 0.5):
@@ -317,8 +322,8 @@ class CombinedLoss(nn.Module):
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.bce = nn.BCELoss()
-        # [shoulder, front, chest, waist, sleeve] — sleeve 2× 가중치
-        self.meas_weights = torch.tensor([1.0, 1.0, 1.2, 1.2, 2.0])
+        # [shoulder, front, chest, waist, sleeve]
+        self.meas_weights = torch.tensor([1.0, 1.0, 1.8, 1.8, 2.0])
 
     def forward(self, seg_pred, seg_gt, meas_pred, meas_gt):
         loss_seg  = self.bce(seg_pred, seg_gt)

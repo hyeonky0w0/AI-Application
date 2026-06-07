@@ -220,7 +220,7 @@ class ClothingDataset(Dataset):
     def __init__(
         self,
         json_dir: str,
-        image_dir: str,
+        image_dir,
         categories: List[str] = ["blouse"],
         view_type: str = "wear",
         use_mediapipe: bool = True,
@@ -230,11 +230,12 @@ class ClothingDataset(Dataset):
         test_ratio: float = 0.1,
         seed: int = 42,
     ):
-        self.json_dir  = json_dir
-        self.image_dir = image_dir
+        self.json_dir   = json_dir
+        self.image_dirs = [image_dir] if isinstance(image_dir, str) else list(image_dir)
         self.view_type = view_type
         self.augment   = augment
         self.scale_normalizer = ScaleNormalizer() if use_mediapipe else None
+        self._image_index = self._build_image_index()
 
         # 이미지 to 텐서
         self.to_tensor = transforms.Compose([
@@ -264,6 +265,22 @@ class ClothingDataset(Dataset):
         self.samples = [self.samples[i] for i in idx]
         logger.info(f"{split} 샘플 수: {len(self.samples)}")
 
+    def _build_image_index(self) -> Dict:
+        # (product_id, view_type) -> 이미지 경로 리스트
+        index = {}
+        for image_dir in self.image_dirs:
+            try:
+                for fname in os.listdir(image_dir):
+                    if not fname.endswith('.jpg'):
+                        continue
+                    parts = fname.split('_')
+                    if len(parts) >= 5:
+                        key = (parts[2], parts[4])
+                        index.setdefault(key, []).append(os.path.join(image_dir, fname))
+            except OSError:
+                continue
+        return index
+
     def _collect_samples(self, categories: List[str]) -> List[str]:
         samples = []
         skipped_type = 0
@@ -274,12 +291,14 @@ class ClothingDataset(Dataset):
             search_dirs = [
                 self.json_dir,
                 os.path.join(self.json_dir, f"label_{cat}"),
+                os.path.join(self.json_dir, f"label_{cat}", f"label_{cat}"),
                 os.path.join(self.json_dir, cat),
             ]
             found_jsons = []
             for d in search_dirs:
                 pattern = os.path.join(d, "*.json")
                 found_jsons.extend(glob.glob(pattern))
+            found_jsons = list(set(found_jsons))
 
             if not found_jsons:
                 logger.warning(f"JSON 없음: {self.json_dir} (카테고리: {cat})")
@@ -316,16 +335,25 @@ class ClothingDataset(Dataset):
 
     def _json_to_img_path(self, data: dict, jpath: str) -> Optional[str]:
         rel = data.get("dataset", {}).get("dataset.image_path", "")
-        if rel:
-            fname = os.path.basename(rel)
-            candidate = os.path.join(self.image_dir, fname)
+        fname_from_rel  = os.path.basename(rel) if rel else None
+        fname_from_json = os.path.basename(jpath).replace(".json", ".jpg")
+
+        for image_dir in self.image_dirs:
+            if fname_from_rel:
+                candidate = os.path.join(image_dir, fname_from_rel)
+                if os.path.exists(candidate):
+                    return candidate
+            candidate = os.path.join(image_dir, fname_from_json)
             if os.path.exists(candidate):
                 return candidate
 
-        json_fname = os.path.basename(jpath).replace(".json", ".jpg")
-        candidate = os.path.join(self.image_dir, json_fname)
-        if os.path.exists(candidate):
-            return candidate
+        # fallback: 제품 ID + view_type으로 매칭 (라벨-이미지 순번 불일치 데이터셋 대응)
+        parts = os.path.basename(jpath).split('_')
+        if len(parts) >= 5:
+            key = (parts[2], parts[4])
+            candidates = self._image_index.get(key, [])
+            if candidates:
+                return candidates[0]
 
         return None
 
@@ -389,7 +417,7 @@ class ClothingDataset(Dataset):
 #DataLoader 생성
 def get_dataloaders(
     json_dir: str,
-    image_dir: str,
+    image_dir,
     categories: List[str] = ["blouse"],
     view_type: str = "wear",
     use_mediapipe: bool = True,
