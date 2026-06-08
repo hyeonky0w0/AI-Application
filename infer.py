@@ -18,7 +18,6 @@ from dataset import (
 )
 from model import (
     ClothingMeasurementNet, ClothingMeasurementNetQFormer,
-    ClothingMeasurementNetQFormerMP,
     ImageOnlyQFormerModel, ImageBodyNoFiLMQFormerModel,
     BaselineMLP, CombinedLoss,
 )
@@ -32,7 +31,6 @@ MODEL_MAP = {
     3: ImageBodyNoFiLMQFormerModel,
     4: ClothingMeasurementNet,
     6: ClothingMeasurementNetQFormer,
-    7: ClothingMeasurementNetQFormerMP,
 }
 
 
@@ -40,7 +38,14 @@ def load_model(ckpt_path: str, device: torch.device):
     ckpt      = torch.load(ckpt_path, map_location=device)
     exp_id    = ckpt["args"].get("exp", 6)
     model_cls = MODEL_MAP.get(exp_id, ClothingMeasurementNetQFormer)
-    model     = model_cls().to(device)
+
+    # 체크포인트에 저장된 no_backbone 플래그를 복원
+    kwargs = {}
+    if exp_id == 3 and ckpt["args"].get("no_backbone", False):
+        kwargs["use_backbone"] = False
+        kwargs["pretrained"]   = False
+
+    model = model_cls(**kwargs).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     return model, ckpt
@@ -54,7 +59,7 @@ def preprocess_image(img_bgr: np.ndarray):
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
-    return tf(pil).unsqueeze(0), lb  # [1,3,H,W], letterbox numpy
+    return tf(pil).unsqueeze(0), lb
 
 
 def load_sample(jpath: str, image_dirs: list):
@@ -211,14 +216,12 @@ def visualize(samples_with_results, out_dir: str):
 
 def main():
     ap = argparse.ArgumentParser(description="Clothing measurement inference demo")
-    ap.add_argument("--ckpt",      required=True, help="checkpoint path (e.g. checkpoints/exp6_qformer/best.pth)")
-    ap.add_argument("--n",         type=int, default=5, help="number of samples to visualize")
+    ap.add_argument("--ckpt",      required=True)
+    ap.add_argument("--n",         type=int, default=5)
     ap.add_argument("--out_dir",   default="./infer_output")
-    ap.add_argument("--seed",      type=int, default=0, help="random seed for sample selection")
-    ap.add_argument("--split",     default="test", choices=["test", "val", "train", "all"],
-                    help="which split to sample from (default: test)")
-    ap.add_argument("--image_dir", nargs="+", default=None,
-                    help="image directories (defaults to checkpoint args)")
+    ap.add_argument("--seed",      type=int, default=0)
+    ap.add_argument("--split",     default="test", choices=["test", "val", "train", "all"])
+    ap.add_argument("--image_dir", nargs="+", default=None)
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -227,7 +230,10 @@ def main():
     print("Loading model...")
     model, ckpt = load_model(args.ckpt, device)
     ckpt_args   = ckpt["args"]
-    print(f"  exp{ckpt_args.get('exp')} ({type(model).__name__}), epoch={ckpt['epoch']}, best_val_mae={ckpt['best_mae']:.2f}cm")
+    no_backbone = ckpt_args.get("no_backbone", False)
+    print(f"  exp{ckpt_args.get('exp')} ({type(model).__name__}), "
+          f"backbone={'off' if no_backbone else 'on'}, "
+          f"epoch={ckpt['epoch']}, best_val_mae={ckpt['best_mae']:.2f}cm")
 
     image_dirs = args.image_dir or ckpt_args["image_dir"]
     if isinstance(image_dirs, str):

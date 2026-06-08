@@ -31,14 +31,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-#Ablation 실험 설정
+# Ablation 실험 설정
 EXPERIMENTS = {
     1: {
         "name":      "exp1_mlp_baseline",
         "desc":      "Exp1: 신체 치수만 입력 (MLP Baseline, 이미지 없음)",
         "model_cls": BaselineMLP,
         "mediapipe": False,
-        "lambda1":   0.0,   # 세그멘테이션 loss 없음
+        "lambda1":   0.0,
         "lambda2":   1.0,
     },
     2: {
@@ -84,7 +84,16 @@ EXPERIMENTS = {
 }
 
 
-#평가 함수
+def _build_model(args, exp_cfg) -> torch.nn.Module:
+    """args와 exp_cfg를 보고 올바른 model_kwargs로 모델을 생성해 반환."""
+    model_kwargs = dict(body_dim=10, num_measurements=5)
+    if args.exp == 3 and getattr(args, "no_backbone", False):
+        model_kwargs["use_backbone"] = False
+        model_kwargs["pretrained"]   = False
+    return exp_cfg["model_cls"](**model_kwargs)
+
+
+# 평가 함수
 def evaluate(
     model: torch.nn.Module,
     loader,
@@ -115,24 +124,23 @@ def evaluate(
             all_pred.append(meas_pred.cpu())
             all_gt.append(clothes.cpu())
 
-    all_pred = torch.cat(all_pred, dim=0)  # [N, 5]
-    all_gt   = torch.cat(all_gt,   dim=0)  # [N, 5]
+    all_pred = torch.cat(all_pred, dim=0)
+    all_gt   = torch.cat(all_gt,   dim=0)
 
-    # cm 단위로 변환 후 MAE/RMSE 계산
     pred_cm = denormalize_clothes(all_pred)
     gt_cm   = denormalize_clothes(all_gt)
 
-    mae_per_item  = (pred_cm - gt_cm).abs().mean(dim=0)   # [5]
+    mae_per_item  = (pred_cm - gt_cm).abs().mean(dim=0)
     rmse_per_item = ((pred_cm - gt_cm)**2).mean(dim=0).sqrt()
 
     item_names = [k.split(".")[-1] for k in CLOTHES_KEYS]
 
     metrics = {
-        "total_loss":  total_loss  / max(n_batches, 1),
-        "seg_loss":    seg_loss_sum / max(n_batches, 1),
-        "meas_loss":   meas_loss_sum / max(n_batches, 1),
-        "mae_overall": mae_per_item.mean().item(),
-        "rmse_overall":rmse_per_item.mean().item(),
+        "total_loss":   total_loss  / max(n_batches, 1),
+        "seg_loss":     seg_loss_sum / max(n_batches, 1),
+        "meas_loss":    meas_loss_sum / max(n_batches, 1),
+        "mae_overall":  mae_per_item.mean().item(),
+        "rmse_overall": rmse_per_item.mean().item(),
         "mae_per_item": {
             name: mae_per_item[i].item()
             for i, name in enumerate(item_names)
@@ -145,7 +153,7 @@ def evaluate(
     return metrics
 
 
-#학습 루프
+# 학습 루프
 def train_one_epoch(
     model: torch.nn.Module,
     loader,
@@ -170,9 +178,7 @@ def train_one_epoch(
         loss, sl, ml = criterion(seg_pred, mask_gt, meas_pred, clothes)
         loss.backward()
 
-        # Gradient clipping — 학습 안정성
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
 
         total_loss    += loss.item()
@@ -198,12 +204,21 @@ def train_one_epoch(
 def train(args):
     exp_cfg = EXPERIMENTS[args.exp]
     use_mediapipe = exp_cfg["mediapipe"] and not args.no_mediapipe
-    exp_name = exp_cfg["name"] + ("_no_norm" if args.no_mediapipe else "")
+
+    # no_backbone 옵션이 켜져 있으면 체크포인트 디렉토리 이름에 반영
+    suffix = ""
+    if args.no_mediapipe:
+        suffix += "_no_norm"
+    if args.exp == 3 and getattr(args, "no_backbone", False):
+        suffix += "_no_backbone"
+    exp_name = exp_cfg["name"] + suffix
 
     logger.info(f"\n{'='*50}")
     logger.info(f"실험: {exp_name}")
     logger.info(f"설명: {exp_cfg['desc']}")
     logger.info(f"MediaPipe: {use_mediapipe}")
+    if args.exp == 3:
+        logger.info(f"Backbone: {not getattr(args, 'no_backbone', False)}")
     logger.info(f"{'='*50}\n")
 
     ckpt_dir   = os.path.join("checkpoints", exp_name)
@@ -242,10 +257,7 @@ def train(args):
                 f"Val: {len(loaders['val'].dataset)}  "
                 f"Test: {len(loaders['test'].dataset)}")
 
-    model = exp_cfg["model_cls"](
-        body_dim=10,
-        num_measurements=5,
-    ).to(device)
+    model = _build_model(args, exp_cfg).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"파라미터 수: {total_params:,}")
 
@@ -260,9 +272,8 @@ def train(args):
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    #학습 루프
-    best_mae  = float("inf")
-    history   = []
+    best_mae = float("inf")
+    history  = []
 
     for epoch in range(1, args.epochs + 1):
         logger.info(f"\n[Epoch {epoch}/{args.epochs}]")
@@ -273,16 +284,6 @@ def train(args):
         val_metrics = evaluate(model, loaders["val"], criterion, device)
         scheduler.step()
 
-        # if epoch == 1 and hasattr(loaders["train"].dataset, "scale_normalizer"):
-        #     norm = loaders["train"].dataset.scale_normalizer
-        #     if norm is not None:
-        #         rate = norm.success_rate()
-        #         logger.info(f"  MediaPipe 성공률: {rate*100:.1f}% "
-        #                     f"({norm.n_success}/{norm.n_total})")
-        #         if rate < 0.5:
-        #             logger.warning("성공률 50% 미만: letterbox fallback 비중 높음")
-
-        # 로그
         logger.info(
             f"  Train Loss: {train_metrics['train_loss']:.4f}  "
             f"Val Loss: {val_metrics['total_loss']:.4f}  "
@@ -292,7 +293,6 @@ def train(args):
         for name, mae in val_metrics["mae_per_item"].items():
             logger.info(f"    {name}: {mae:.2f}cm")
 
-        # 체크포인트 저장
         row = {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}, "epoch": epoch}
         history.append(row)
 
@@ -314,7 +314,6 @@ def train(args):
             torch.save(ckpt_payload, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
             logger.info(f"  체크포인트 저장: epoch_{epoch:03d}.pth")
 
-        #wandb 로깅
         if use_wandb:
             log_dict = {
                 "epoch":           epoch,
@@ -330,7 +329,7 @@ def train(args):
                 log_dict[f"val/mae_{name}"] = mae
             wandb.log(log_dict)
 
-    #테스트 평가
+    # 테스트 평가
     logger.info("\n[Test 평가]")
     ckpt = torch.load(os.path.join(ckpt_dir, "best.pth"), map_location=device)
     model.load_state_dict(ckpt["model_state"])
@@ -342,7 +341,6 @@ def train(args):
     for name, mae in test_metrics["mae_per_item"].items():
         logger.info(f"  {name}: {mae:.2f}cm")
 
-    # 결과 저장
     results = {
         "exp_name":     exp_name,
         "exp_desc":     exp_cfg["desc"],
@@ -368,9 +366,8 @@ def train(args):
     return results
 
 
-#Ablation 전체 실행 함수
+# Ablation 전체 실행 함수
 def run_all_ablations(args):
-    # Exp1~4: 구성요소 ablation, Exp6: 최종 모델 (Q-Former)
     ablation_ids = [1, 2, 3, 4, 6]
     all_results = {}
     for exp_id in ablation_ids:
@@ -381,8 +378,7 @@ def run_all_ablations(args):
         result = train(args)
         all_results[exp_id] = result
 
-    # 비교 테이블
-    item_keys = ["shoulder_width", "front_length", "chest_size", "waist_size", "sleeve_length"]
+    item_keys   = ["shoulder_width", "front_length", "chest_size", "waist_size", "sleeve_length"]
     item_labels = ["어깨", "총장", "가슴", "허리", "소매"]
     col_w = 8
 
@@ -404,23 +400,19 @@ def run_all_ablations(args):
         print(row)
     print("="*80)
 
+
 def parse_args():
     p = argparse.ArgumentParser(description="의류 치수 추정 모델 학습")
-    p.add_argument("--json_dir",    type=str, required=True,
-                   help="JSON 라벨 디렉토리 (예: /data/.../label_blouse)")
-    p.add_argument("--image_dir",   type=str, nargs="+", required=True,
-                   help="이미지 디렉토리 (여러 개 가능, 예: /data/.../image_blouse /data/.../image_shirt)")
-    p.add_argument("--exp",         type=int,   default=4, choices=[1,2,3,4,5,6],
-                   help="실험 번호 (1=MLP, 2=세그no정규화, 3=FiLM없음, 4=Full)")
-    p.add_argument("--all",         action="store_true",
-                   help="Ablation 전체 순차 실행 (Exp1~4 + Exp6 최종 모델)")
-    p.add_argument("--no_mediapipe",action="store_true",
-                   help="MediaPipe 스케일 정규화 비활성화 (Ablation용)")
-    p.add_argument("--categories",  nargs="+",  default=["blouse", "coat", "shirt"],
-                   help="학습할 의류 카테고리")
+    p.add_argument("--json_dir",    type=str, required=True)
+    p.add_argument("--image_dir",   type=str, nargs="+", required=True)
+    p.add_argument("--exp",         type=int,   default=4, choices=[1,2,3,4,5,6])
+    p.add_argument("--all",         action="store_true")
+    p.add_argument("--no_mediapipe",action="store_true")
+    p.add_argument("--no_backbone", action="store_true",
+                   help="백본(ResNet50) 대신 LightEncoder 사용 (exp3 전용)")
+    p.add_argument("--categories",  nargs="+",  default=["blouse", "coat", "shirt"])
     p.add_argument("--view_type",   type=str,   default="front",
-                   choices=["front", "wear", "all"],
-                   help="사용할 이미지 각도 타입")
+                   choices=["front", "wear", "all"])
     p.add_argument("--epochs",      type=int,   default=30)
     p.add_argument("--batch_size",  type=int,   default=16)
     p.add_argument("--lr",          type=float, default=1e-4)
@@ -429,18 +421,12 @@ def parse_args():
     p.add_argument("--val_ratio",   type=float, default=0.1)
     p.add_argument("--test_ratio",  type=float, default=0.1)
     p.add_argument("--seed",        type=int,   default=42)
-    p.add_argument("--eval_only",   action="store_true",
-                   help="체크포인트 로드 후 val/test 평가만 실행")
-    p.add_argument("--body_ablation", action="store_true",
-                   help="신체치수 피처 하나씩 마스킹해 중요도 측정")
-    p.add_argument("--ckpt",        type=str,   default=None,
-                   help="--eval_only / --body_ablation 시 사용할 .pth 경로 (미지정 시 checkpoints/{exp}/best.pth)")
-    p.add_argument("--wandb_project", type=str, default=None,
-                   help="W&B 프로젝트 이름 (미지정 시 W&B 비활성화)")
-    p.add_argument("--wandb_run",   type=str,   default=None,
-                   help="W&B run 이름 (미지정 시 exp_name 사용)")
-    p.add_argument("--ckpt_interval", type=int, default=10,
-                   help="N 에폭마다 체크포인트 저장 (기본 10)")
+    p.add_argument("--eval_only",   action="store_true")
+    p.add_argument("--body_ablation", action="store_true")
+    p.add_argument("--ckpt",        type=str,   default=None)
+    p.add_argument("--wandb_project", type=str, default=None)
+    p.add_argument("--wandb_run",   type=str,   default=None)
+    p.add_argument("--ckpt_interval", type=int, default=10)
     return p.parse_args()
 
 
@@ -451,8 +437,7 @@ BODY_FEATURE_NAMES = [
 ]
 
 
-def evaluate_masked(model, loader, criterion, device, mask_idx: int) -> float:
-    #body_vec의 mask_idx 번째 피처를 0으로 마스킹한 뒤 MAE 반환
+def evaluate_masked(model, loader, criterion, device, mask_idx: int):
     model.eval()
     all_pred, all_gt = [], []
     with torch.no_grad():
@@ -476,9 +461,10 @@ def evaluate_masked(model, loader, criterion, device, mask_idx: int) -> float:
 
 
 def body_ablation(args):
-    #각 신체치수 피처를 하나씩 0으로 마스킹해 MAE 변화 측정
-    exp_cfg   = EXPERIMENTS[args.exp]
-    exp_name  = exp_cfg["name"] + ("_no_norm" if args.no_mediapipe else "")
+    exp_cfg  = EXPERIMENTS[args.exp]
+    suffix   = ("_no_norm" if args.no_mediapipe else "") + \
+               ("_no_backbone" if args.exp == 3 and getattr(args, "no_backbone", False) else "")
+    exp_name = exp_cfg["name"] + suffix
     ckpt_path = args.ckpt or os.path.join("checkpoints", exp_name, "best.pth")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -496,15 +482,14 @@ def body_ablation(args):
         seed=args.seed,
     )
 
-    model = exp_cfg["model_cls"](body_dim=10, num_measurements=5).to(device)
+    model = _build_model(args, exp_cfg).to(device)
     ckpt  = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     criterion = CombinedLoss(lambda1=exp_cfg["lambda1"], lambda2=exp_cfg["lambda2"])
 
-    # 베이스라인 (마스킹 없음)
     base = evaluate(model, loaders["test"], criterion, device)
-    base_mae     = base["mae_overall"]
-    base_per     = list(base["mae_per_item"].values())
+    base_mae      = base["mae_overall"]
+    base_per      = list(base["mae_per_item"].values())
     clothes_names = list(base["mae_per_item"].keys())
 
     print(f"\n{'='*65}")
@@ -534,7 +519,9 @@ def body_ablation(args):
 
 def eval_only(args):
     exp_cfg  = EXPERIMENTS[args.exp]
-    exp_name = exp_cfg["name"] + ("_no_norm" if args.no_mediapipe else "")
+    suffix   = ("_no_norm" if args.no_mediapipe else "") + \
+               ("_no_backbone" if args.exp == 3 and getattr(args, "no_backbone", False) else "")
+    exp_name = exp_cfg["name"] + suffix
     ckpt_path = args.ckpt or os.path.join("checkpoints", exp_name, "best.pth")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -553,7 +540,7 @@ def eval_only(args):
         seed=args.seed,
     )
 
-    model = exp_cfg["model_cls"](body_dim=10, num_measurements=5).to(device)
+    model = _build_model(args, exp_cfg).to(device)
     ckpt  = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     logger.info(f"epoch {ckpt['epoch']} 체크포인트 로드")

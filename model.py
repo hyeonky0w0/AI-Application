@@ -24,6 +24,7 @@ class FiLM(nn.Module):
         beta  = beta.unsqueeze(-1).unsqueeze(-1)
         return gamma * feature + beta
 
+
 class BodyCrossAttention(nn.Module):
     def __init__(self, feat_dim: int, body_dim: int,
                  num_heads: int = 8, dropout: float = 0.1):
@@ -46,10 +47,10 @@ class BodyCrossAttention(nn.Module):
 
         feat_seq = feature.flatten(2).permute(0, 2, 1)
 
-        idx        = torch.arange(self.body_dim, device=body_vec.device)
-        pos_emb    = self.pos_embed(idx)                      
-        val_emb    = self.val_embed(body_vec.unsqueeze(-1))   
-        body_tokens = val_emb + pos_emb                       
+        idx         = torch.arange(self.body_dim, device=body_vec.device)
+        pos_emb     = self.pos_embed(idx)
+        val_emb     = self.val_embed(body_vec.unsqueeze(-1))
+        body_tokens = val_emb + pos_emb
 
         attended, _ = self.cross_attn(
             query=feat_seq,
@@ -89,6 +90,7 @@ class ConvBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
 
+
 class Encoder(nn.Module):
     def __init__(self, body_dim: int, pretrained: bool = True,
                  use_cross_attn: bool = False, use_film: bool = True):
@@ -114,11 +116,54 @@ class Encoder(nn.Module):
         self.cond5 = cond_cls(2048, body_dim)
 
     def forward(self, x: torch.Tensor, body_vec: torch.Tensor):
-        e1 = self.enc1(x)                         
-        e2 = self.enc2(self.pool(e1))             
-        e3 = self.cond3(self.enc3(e2), body_vec)  
-        e4 = self.cond4(self.enc4(e3), body_vec)  
-        e5 = self.cond5(self.enc5(e4), body_vec)  
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.cond3(self.enc3(e2), body_vec)
+        e4 = self.cond4(self.enc4(e3), body_vec)
+        e5 = self.cond5(self.enc5(e4), body_vec)
+        return e1, e2, e3, e4, e5
+
+
+class LightEncoder(nn.Module):
+    """백본 없는 경량 CNN 인코더. Decoder의 skip connection 채널 규격을 그대로 맞춤.
+    e1:64  e2:256  e3:512  e4:1024  e5:2048
+    공간 해상도: 224 → 112 → 56 → 28 → 14  (MaxPool2d×4)
+    """
+    def __init__(self, body_dim: int):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(3,  64, 3, padding=1, bias=False), nn.BatchNorm2d(64),  nn.ReLU(True),
+            nn.Conv2d(64, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64),  nn.ReLU(True),
+        )
+        self.pool = nn.MaxPool2d(2)
+
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(64,  128, 3, padding=1, bias=False), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.Conv2d(128, 256, 3, padding=1, bias=False), nn.BatchNorm2d(256), nn.ReLU(True),
+        )
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(256, 512, 3, padding=1, bias=False), nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.Conv2d(512, 512, 3, padding=1, bias=False), nn.BatchNorm2d(512), nn.ReLU(True),
+        )
+        self.enc4 = nn.Sequential(
+            nn.Conv2d(512,  1024, 3, padding=1, bias=False), nn.BatchNorm2d(1024), nn.ReLU(True),
+            nn.Conv2d(1024, 1024, 3, padding=1, bias=False), nn.BatchNorm2d(1024), nn.ReLU(True),
+        )
+        self.enc5 = nn.Sequential(
+            nn.Conv2d(1024, 2048, 3, padding=1, bias=False), nn.BatchNorm2d(2048), nn.ReLU(True),
+            nn.Conv2d(2048, 2048, 3, padding=1, bias=False), nn.BatchNorm2d(2048), nn.ReLU(True),
+        )
+        # 백본 없이 쓰는 인코더이므로 body 조건화는 Identity로 고정
+        self.cond3 = IdentityConditioning()
+        self.cond4 = IdentityConditioning()
+        self.cond5 = IdentityConditioning()
+
+    def forward(self, x: torch.Tensor, body_vec: torch.Tensor):
+        e1 = self.enc1(x)                   # [B,   64, 224, 224]
+        e2 = self.enc2(self.pool(e1))        # [B,  256, 112, 112]
+        e3 = self.enc3(self.pool(e2))        # [B,  512,  56,  56]
+        e4 = self.enc4(self.pool(e3))        # [B, 1024,  28,  28]
+        e5 = self.enc5(self.pool(e4))        # [B, 2048,  14,  14]
         return e1, e2, e3, e4, e5
 
 
@@ -133,10 +178,10 @@ class Bottleneck(nn.Module):
             cond_cls = FiLM
         else:
             cond_cls = IdentityConditioning
-        self.cond  = cond_cls(1024, body_dim)
+        self.cond = cond_cls(1024, body_dim)
 
     def forward(self, x: torch.Tensor, body_vec: torch.Tensor) -> torch.Tensor:
-        return self.cond(self.block(x), body_vec)   
+        return self.cond(self.block(x), body_vec)
 
 
 class Decoder(nn.Module):
@@ -164,7 +209,7 @@ class Decoder(nn.Module):
         d3 = self.dec3(torch.cat([self.up3(d4),   e3], dim=1))
         d2 = self.dec2(torch.cat([self.up2(d3),   e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2),   e1], dim=1))
-        d0 = self.dec0(self.up0(d1))                          
+        d0 = self.dec0(self.up0(d1))
         seg = torch.sigmoid(self.seg_head(d0))
         return seg, d1
 
@@ -203,7 +248,7 @@ class MeasurementQueryTransformer(nn.Module):
                  num_measurements: int = 5, num_heads: int = 4,
                  num_layers: int = 2, dropout: float = 0.1):
         super().__init__()
-        self.body_dim        = body_dim
+        self.body_dim         = body_dim
         self.num_measurements = num_measurements
 
         self.meas_queries = nn.Parameter(torch.randn(num_measurements, feat_dim))
@@ -222,7 +267,6 @@ class MeasurementQueryTransformer(nn.Module):
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        # 쿼리 1개 → 치수 1개 (scalar)
         self.head = nn.Sequential(
             nn.LayerNorm(feat_dim),
             nn.Linear(feat_dim, 1),
@@ -234,7 +278,6 @@ class MeasurementQueryTransformer(nn.Module):
 
         img_tokens = seg_feat.flatten(2).permute(0, 2, 1)
 
-        # seg_mask로 옷 영역 토큰 강조
         if seg_mask is not None:
             w = F.interpolate(seg_mask, size=seg_feat.shape[2:],
                               mode='bilinear', align_corners=False)
@@ -242,28 +285,32 @@ class MeasurementQueryTransformer(nn.Module):
 
         if self.body_dim > 0:
             idx         = torch.arange(self.body_dim, device=body_vec.device)
-            pos_emb     = self.body_pos_embed(idx)                    
-            val_emb     = self.body_val_embed(body_vec.unsqueeze(-1)) 
-            body_tokens = val_emb + pos_emb                           
-            context = torch.cat([img_tokens, body_tokens], dim=1)     
+            pos_emb     = self.body_pos_embed(idx)
+            val_emb     = self.body_val_embed(body_vec.unsqueeze(-1))
+            body_tokens = val_emb + pos_emb
+            context = torch.cat([img_tokens, body_tokens], dim=1)
         else:
-            context = img_tokens                                     
+            context = img_tokens
 
         queries = self.meas_queries.unsqueeze(0).expand(B, -1, -1)
-
-        out = self.transformer(queries, context)  
-
-        meas = self.head(out).squeeze(-1)          
+        out  = self.transformer(queries, context)
+        meas = self.head(out).squeeze(-1)
         return meas
 
 
 class ClothingMeasurementNet(nn.Module):
     def __init__(self, body_dim: int = 10, num_measurements: int = 5,
                  pretrained: bool = True, use_cross_attn: bool = False,
-                 use_film: bool = True, head_type: str = "attn"):
+                 use_film: bool = True, head_type: str = "attn",
+                 use_backbone: bool = True):
         super().__init__()
-        self.encoder    = Encoder(body_dim, pretrained=pretrained,
-                                  use_cross_attn=use_cross_attn, use_film=use_film)
+
+        if use_backbone:
+            self.encoder = Encoder(body_dim, pretrained=pretrained,
+                                   use_cross_attn=use_cross_attn, use_film=use_film)
+        else:
+            self.encoder = LightEncoder(body_dim)
+
         self.bottleneck = Bottleneck(body_dim, use_cross_attn=use_cross_attn,
                                      use_film=use_film)
         self.decoder    = Decoder()
@@ -309,11 +356,15 @@ class ImageOnlyQFormerModel(ClothingMeasurementNet):
 
 
 class ImageBodyNoFiLMQFormerModel(ClothingMeasurementNet):
-    """Exp3: 이미지 + body, FiLM 없음, Q-Former 헤드."""
+    """Exp3: 이미지 + body, FiLM 없음, Q-Former 헤드.
+    use_backbone=False 시 LightEncoder 사용.
+    """
     def __init__(self, body_dim: int = 10, num_measurements: int = 5,
-                 pretrained: bool = True):
+                 pretrained: bool = True, use_backbone: bool = True):
         super().__init__(body_dim, num_measurements, pretrained,
-                         use_cross_attn=False, use_film=False, head_type="qformer")
+                         use_cross_attn=False, use_film=False,
+                         head_type="qformer",
+                         use_backbone=use_backbone)
 
 
 class CombinedLoss(nn.Module):
@@ -414,24 +465,23 @@ class NoFiLMModel(nn.Module):
             nn.Conv2d(512, 512, 3, padding=1, bias=False), nn.BatchNorm2d(512), nn.ReLU(True),
         )
         self.neck = nn.Sequential(
-            nn.Conv2d(512, 1024, 3, padding=1, bias=False), nn.BatchNorm2d(1024), nn.ReLU(True),
-            nn.Conv2d(1024,1024, 3, padding=1, bias=False), nn.BatchNorm2d(1024), nn.ReLU(True),
+            nn.Conv2d(512,  1024, 3, padding=1, bias=False), nn.BatchNorm2d(1024), nn.ReLU(True),
+            nn.Conv2d(1024, 1024, 3, padding=1, bias=False), nn.BatchNorm2d(1024), nn.ReLU(True),
         )
-        
-        self.up4   = nn.ConvTranspose2d(1024, 512, 2, stride=2)
-        self.dec4  = ConvBlock(512 + 512,  512)   # 1024ch (e4=512)
 
-        self.up3   = nn.ConvTranspose2d(512, 256, 2, stride=2)
-        self.dec3  = ConvBlock(256 + 256,  256)   # 512ch  (e3=256)
+        self.up4  = nn.ConvTranspose2d(1024, 512, 2, stride=2)
+        self.dec4 = ConvBlock(512 + 512, 512)
 
-        self.up2   = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.dec2  = ConvBlock(128 + 128,  128)   # 256ch  (e2=128)
+        self.up3  = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec3 = ConvBlock(256 + 256, 256)
 
-        self.up1   = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec1  = ConvBlock(64  + 64,   64)    # 128ch  (e1=64)
+        self.up2  = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec2 = ConvBlock(128 + 128, 128)
+
+        self.up1  = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec1 = ConvBlock(64  + 64,  64)
 
         self.seg_head = nn.Conv2d(64, 1, 1)
-
         self.reg_head = RegressionHead(body_dim, num_measurements)
         self.pool     = nn.MaxPool2d(2)
 
@@ -458,10 +508,13 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     models_to_test = [
-        ("ClothingMeasurementNet", ClothingMeasurementNet(BODY_DIM, pretrained=False)),
-        ("BaselineMLP",            BaselineMLP(BODY_DIM)),
-        ("SegOnlyModel",           SegOnlyModel(BODY_DIM)),
-        ("NoFiLMModel",            NoFiLMModel(BODY_DIM)),
+        ("ClothingMeasurementNet (backbone)",    ClothingMeasurementNet(BODY_DIM, pretrained=False)),
+        ("ClothingMeasurementNet (no_backbone)", ClothingMeasurementNet(BODY_DIM, pretrained=False, use_backbone=False)),
+        ("ImageBodyNoFiLMQFormerModel (backbone)",    ImageBodyNoFiLMQFormerModel(BODY_DIM)),
+        ("ImageBodyNoFiLMQFormerModel (no_backbone)", ImageBodyNoFiLMQFormerModel(BODY_DIM, pretrained=False, use_backbone=False)),
+        ("BaselineMLP",  BaselineMLP(BODY_DIM)),
+        ("SegOnlyModel", SegOnlyModel(BODY_DIM)),
+        ("NoFiLMModel",  NoFiLMModel(BODY_DIM)),
     ]
 
     print("=== 모델 Shape 검증 ===\n")
@@ -475,7 +528,7 @@ if __name__ == "__main__":
         print(f"  seg : {seg.shape}  meas: {meas.shape}")
         print(f"  params: {params:,}\n")
 
-    #loss
+    # loss 검증
     model = ClothingMeasurementNet(BODY_DIM, pretrained=False).to(device)
     img   = torch.randn(B, 3, 224, 224).to(device)
     body  = torch.randn(B, BODY_DIM).to(device)
