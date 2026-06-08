@@ -18,9 +18,6 @@ TARGET_SIZE = 224
 BODY_STATS = {
     "body_height":          (161.6, 5.0),
     "breast_size_female":   (86.5,  7.2),
-    "waist_size":           (73.5,  8.6),
-    "hip_seize":            (93.0,  5.9),
-    "waist_height":         (96.5,  5.3),
     "weight":               (54.9,  7.7),
 }
 
@@ -170,9 +167,6 @@ def normalize_body(meta: dict) -> torch.Tensor:
     raw = {
         "body_height":        g("metadata.model.body_height", 161),
         "breast_size_female": g("metadata.model.breast_size_female", 87),
-        "waist_size":         g("metadata.model.waist_size", 74),
-        "hip_seize":          g("metadata.model.hip_seize", 93),
-        "waist_height":       g("metadata.model.waist_height", 97),
         "weight":             g("metadata.model.weight", 57),
     }
     return torch.tensor(
