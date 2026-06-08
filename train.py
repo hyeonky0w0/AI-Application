@@ -20,6 +20,7 @@ from dataset import (
 from model import (
     ClothingMeasurementNet, ClothingMeasurementNetCA,
     ClothingMeasurementNetQFormer,
+    ImageOnlyQFormerModel, ImageBodyNoFiLMQFormerModel,
     BaselineMLP, NoFiLMModel, CombinedLoss
 )
 
@@ -41,17 +42,17 @@ EXPERIMENTS = {
         "lambda2":   1.0,
     },
     2: {
-        "name":      "exp2_image_only",
-        "desc":      "Exp2: 이미지만 입력 (신체 정보 완전 제거, FiLM 없음)",
-        "model_cls": NoFiLMModel,
+        "name":      "exp2_image_only_qformer",
+        "desc":      "Exp2: 이미지만 (body 없음, FiLM 없음, Q-Former)",
+        "model_cls": ImageOnlyQFormerModel,
         "mediapipe": False,
         "lambda1":   1.0,
         "lambda2":   0.1,
     },
     3: {
-        "name":      "exp3_image_body_concat",
-        "desc":      "Exp3: 이미지 + body concat (FiLM 없음)",
-        "model_cls": NoFiLMModel,
+        "name":      "exp3_image_body_no_film_qformer",
+        "desc":      "Exp3: 이미지 + body (FiLM 없음, Q-Former)",
+        "model_cls": ImageBodyNoFiLMQFormerModel,
         "mediapipe": False,
         "lambda1":   1.0,
         "lambda2":   0.1,
@@ -78,7 +79,7 @@ EXPERIMENTS = {
         "model_cls": ClothingMeasurementNetQFormer,
         "mediapipe": False,
         "lambda1":   1.0,
-        "lambda2":   0.1,
+        "lambda2":   0.5,
     },
 }
 
@@ -369,8 +370,10 @@ def train(args):
 
 #Ablation 전체 실행 함수
 def run_all_ablations(args):
+    # Exp1~4: 구성요소 ablation, Exp6: 최종 모델 (Q-Former)
+    ablation_ids = [1, 2, 3, 4, 6]
     all_results = {}
-    for exp_id in [1, 2, 3, 4]:
+    for exp_id in ablation_ids:
         logger.info(f"\n{'#'*60}")
         logger.info(f"# Ablation Exp {exp_id}: {EXPERIMENTS[exp_id]['desc']}")
         logger.info(f"{'#'*60}")
@@ -378,36 +381,39 @@ def run_all_ablations(args):
         result = train(args)
         all_results[exp_id] = result
 
-    # 비교 테이블 출력
-    print("\n" + "="*60)
-    print("Ablation 결과 비교 (Test MAE, cm)")
-    print("="*60)
-    header = f"{'실험':<35} {'전체MAE':>8} {'어깨':>8} {'총장':>8} {'가슴':>8} {'소매':>8}"
-    print(header)
-    print("-"*60)
+    # 비교 테이블
+    item_keys = ["shoulder_width", "front_length", "chest_size", "waist_size", "sleeve_length"]
+    item_labels = ["어깨", "총장", "가슴", "허리", "소매"]
+    col_w = 8
 
-    item_keys = ["shoulder_width", "front_length", "chest_size", "sleeve_length"]
+    print("\n" + "="*80)
+    print("Ablation 결과 비교 (Test MAE, cm)")
+    print("="*80)
+    header = f"{'실험':<40} {'전체':>{col_w}}" + "".join(f"{lb:>{col_w}}" for lb in item_labels)
+    print(header)
+    print("-"*80)
+
     for exp_id, result in all_results.items():
         tm = result["test_metrics"]
         mae_items = tm["mae_per_item"]
+        desc = EXPERIMENTS[exp_id]["desc"][:38]
         row = (
-            f"{EXPERIMENTS[exp_id]['desc']:<35} "
-            f"{tm['mae_overall']:>8.2f} "
-            + " ".join(f"{mae_items.get(k, 0):>8.2f}" for k in item_keys)
+            f"{desc:<40} {tm['mae_overall']:>{col_w}.2f}"
+            + "".join(f"{mae_items.get(k, 0):>{col_w}.2f}" for k in item_keys)
         )
         print(row)
-    print("="*60)
+    print("="*80)
 
 def parse_args():
     p = argparse.ArgumentParser(description="의류 치수 추정 모델 학습")
     p.add_argument("--json_dir",    type=str, required=True,
                    help="JSON 라벨 디렉토리 (예: /data/.../label_blouse)")
-    p.add_argument("--image_dir",   type=str, required=True,
-                   help="이미지 디렉토리 (예: /data/.../image_blouse)")
+    p.add_argument("--image_dir",   type=str, nargs="+", required=True,
+                   help="이미지 디렉토리 (여러 개 가능, 예: /data/.../image_blouse /data/.../image_shirt)")
     p.add_argument("--exp",         type=int,   default=4, choices=[1,2,3,4,5,6],
                    help="실험 번호 (1=MLP, 2=세그no정규화, 3=FiLM없음, 4=Full)")
     p.add_argument("--all",         action="store_true",
-                   help="Exp 1~4 전체 Ablation 순차 실행")
+                   help="Ablation 전체 순차 실행 (Exp1~4 + Exp6 최종 모델)")
     p.add_argument("--no_mediapipe",action="store_true",
                    help="MediaPipe 스케일 정규화 비활성화 (Ablation용)")
     p.add_argument("--categories",  nargs="+",  default=["blouse", "coat", "shirt"],
