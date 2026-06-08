@@ -55,7 +55,7 @@ EXPERIMENTS = {
         "model_cls": ImageBodyNoFiLMQFormerModel,
         "mediapipe": False,
         "lambda1":   1.0,
-        "lambda2":   0.1,
+        "lambda2":   0.5,
     },
     4: {
         "name":      "exp4_backbone",
@@ -243,7 +243,7 @@ def train(args):
                 f"Test: {len(loaders['test'].dataset)}")
 
     model = exp_cfg["model_cls"](
-        body_dim=10,
+        body_dim=6,
         num_measurements=5,
     ).to(device)
     total_params = sum(p.numel() for p in model.parameters())

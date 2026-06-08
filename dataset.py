@@ -20,12 +20,8 @@ BODY_STATS = {
     "breast_size_female":   (86.5,  7.2),
     "waist_size":           (73.5,  8.6),
     "hip_seize":            (93.0,  5.9),
-    "shoulders_width":      (40.4,  2.4),
-    "arm_length":           (52.7,  2.3),
     "waist_height":         (96.5,  5.3),
-    "back_length":          (40.8,  2.7),
     "weight":               (54.9,  7.7),
-    "gender":               (0.5,   0.5),
 }
 
 CLOTHES_KEYS = [
@@ -176,12 +172,8 @@ def normalize_body(meta: dict) -> torch.Tensor:
         "breast_size_female": g("metadata.model.breast_size_female", 87),
         "waist_size":         g("metadata.model.waist_size", 74),
         "hip_seize":          g("metadata.model.hip_seize", 93),
-        "shoulders_width":    g("metadata.model.shoulders_width", 39),
-        "arm_length":         g("metadata.model.arm_length", 54),
         "waist_height":       g("metadata.model.waist_height", 97),
-        "back_length":        g("metadata.model.back_length", 42),
         "weight":             g("metadata.model.weight", 57),
-        "gender":             gender,
     }
     return torch.tensor(
         [(v - BODY_STATS[k][0]) / BODY_STATS[k][1] for k, v in raw.items()],
