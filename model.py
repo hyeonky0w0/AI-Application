@@ -395,7 +395,7 @@ class SegOnlyModel(nn.Module):
 
 
 class NoFiLMModel(nn.Module):
-    def __init__(self, body_dim: int = 10, num_measurements: int = 5):
+    def __init__(self, body_dim: int = 6, num_measurements: int = 5):
         super().__init__()
         self.enc1 = nn.Sequential(
             nn.Conv2d(3,   64,  3, padding=1, bias=False), nn.BatchNorm2d(64),  nn.ReLU(True),
